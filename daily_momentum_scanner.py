@@ -230,7 +230,7 @@ def calculate_signals(ticker, sp_close):
 
     # 自定义 RS Rating（百分位，使用RS line）
     rs_rating = calculate_rs_rating(close, sp_close) if sp_close is not None else None
-    rs_strong = rs_rating is not None and rs_rating >= 80
+    rs_strong = rs_rating is not None and rs_rating >= 70
 
     # 机构买入
     inst_buy = (ma50 is not None and vol_20_ratio > 1.5 and price > ma50)
@@ -257,6 +257,7 @@ def calculate_signals(ticker, sp_close):
         'RSI': round(rsi_14, 1) if rsi_14 is not None else None,
         'Vol_20_Ratio': round(vol_20_ratio, 2),
         'Vol_7_Ratio': round(vol_7_ratio, 2),
+        'Volume': volume,
         'RS_Rating': rs_rating
     }
 
@@ -291,17 +292,20 @@ if __name__ == "__main__":
         print("\n今日无推荐股票")
         exit()
 
-    # 1. 先选出 Score 前 TOP_N
-    top_df = pd.DataFrame(results).sort_values('Score', ascending=False).head(TOP_N)
+    # 1. 原始数据
+    df = pd.DataFrame(results)
 
-    # 2. 找出 SELF_SELECTED 中不在 top_df 的股票
+    # 2. 取 Top‑N
+    top_df = df.sort_values('Score', ascending=False).head(TOP_N)
+
+    # 3. 找出 SELF_SELECTED 中不在 top_df 的股票
     self_selected_df = pd.DataFrame(results)
     self_selected_df = self_selected_df[self_selected_df['Ticker'].isin(SELF_SELECTED)]
 
-    # 3. 合并，并去重（以 Ticker 为准）
+    # 4. 合并，并去重（以 Ticker 为准）
     final_df = pd.concat([top_df, self_selected_df]).drop_duplicates(subset='Ticker').reset_index(drop=True)
 
-    # 4. （可选）重新按 Score 排序，但 SELF_SELECTED 一定在结果中
+    # 5. （可选）重新按 Score 排序，但 SELF_SELECTED 一定在结果中
     final_df = final_df.sort_values('Score', ascending=False).reset_index(drop=True)
 
     print("\n" + "="*100)
