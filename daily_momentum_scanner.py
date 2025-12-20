@@ -53,6 +53,12 @@ UNIVERSE = [
     'IVZ', 'AES', 'MRNA', 'IPG', 'BAX', 'MGM', 'NCLH', 'MOS', 'CAG', 'APA',
     'SOLS'
 ]
+# UNIVERSE = [
+#     'SMCI', 'GOOG', 'PLTR', 'AVGO', 'UNH', 'NVDA', 'AMD', 'MSFT', 'ORCL', 'TSM'
+# ]
+# SELF_SELECTED = [
+#     'SMCI', 'GOOG', 'PLTR', 'AVGO', 'UNH', 'NVDA', 'AMD', 'MSFT', 'ORCL', 'TSM'
+# ]
 SELF_SELECTED = []
 TOP_N = 10
 CACHE_FILE = "yahoo_custom_cache.pkl"
@@ -214,9 +220,10 @@ def calculate_signals(ticker, sp_close):
         return None
 
     # 均线
+    ma10 = last_scalar_from(close.rolling(10).mean())
+    ma20 = last_scalar_from(close.rolling(20).mean())
     ma50 = last_scalar_from(close.rolling(50).mean())
-    ma200 = last_scalar_from(close.rolling(200).mean())
-    ma_bull = (ma50 is not None and ma200 is not None and price > ma50 > ma200)
+    ma_bull = (ma10 is not None and ma20 is not None and ma50 is not None and price > ma10 > ma20 > ma50)
 
     # 52周新高突破
     high52_prev = last_scalar_from(high.rolling(252).max().shift(1))
