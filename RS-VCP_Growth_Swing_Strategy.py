@@ -361,8 +361,11 @@ def update_recent_prices():
 # Stage 2：SwingTrend 技术筛选（全部在 DuckDB 内完成）
 # ============================================================
 
-def build_stage2_swingtrend(target_date: date) -> pd.DataFrame:
+def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.DataFrame:
     con = duckdb.connect(DUCKDB_PATH)
+
+    # 将列表转换为 SQL 字符串格式 ('AAPL', 'TSLA')
+    monitor_str = ", ".join([f"'{t}'" for t in monitor_list]) if monitor_list else "''"
 
     sql = f"""
     /* ======================================================
@@ -509,108 +512,35 @@ def build_stage2_swingtrend(target_date: date) -> pd.DataFrame:
 
     WHERE
         b.trade_date = DATE '{target_date}'
+        AND (
+            (
+                /* ===== Trend Template（可调阈值） ===== */
+                b.close > b.ma150
+                AND b.ma150 > b.ma200
+                AND b.ma50  > b.ma150
+                AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
+                AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
 
-        /* ===== Trend Template（可调阈值） ===== */
-        AND b.close > b.ma150
-        AND b.ma150 > b.ma200
-        AND b.ma50  > b.ma150
-        AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
-        AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
+                /* ===== RS Rank 门槛 ===== */
+                AND r.rs_rank >= 70
 
-        /* ===== RS Rank 门槛 ===== */
-        AND r.rs_rank >= 70
+                /* ===== VCP：波动正在收缩 ===== */
+                AND a.atr10 < a.atr50
 
-        /* ===== VCP：波动正在收缩 ===== */
-        AND a.atr10 < a.atr50
+                /* ===== Pivot 放量突破 ===== */
+                AND b.close > p.pivot_price
+                AND v.volume >= 1.5 * v.vol50     -- 放量倍数（可调）
+            )
+            OR
+            -- 新增：如果是自选股，强制通过筛选
+            b.stock_code IN ({monitor_str})
+        )
 
-        /* ===== Pivot 放量突破 ===== */
-        AND b.close > p.pivot_price
-        -- AND b.close > b.ma50
-        AND v.volume >= 1.5 * v.vol50     -- 放量倍数（可调）
     """
 
     df = con.execute(sql).df()
     con.close()
     return df
-
-
-# ============================================================
-# Stage 3：Minervini 基本面打分（只对 Stage 2 股票）
-# ============================================================
-
-def build_stage3_fundamental(stage2_df: pd.DataFrame) -> pd.DataFrame:
-    results = []
-
-    # 定义标准列名
-    cols = ["stock_code", "eps_acceleration", "roe", "revenue_growth", "fcf_quality", "fundamental_score"]
-    
-    if stage2_df.empty:
-        print("⚠️ Stage 2 过滤后无候选股，跳过基本面评分。")
-        # 修正：返回一个带有列名但没有行的数据框
-        return pd.DataFrame(columns=cols)
-
-    for symbol in stage2_df["stock_code"]:
-        try:
-            print(f"正在获取 {symbol} 的基本面数据...")
-            t = yf.Ticker(symbol)
-            info = t.info
-
-            # ===== 1. EPS 增长与加速 (Minervini 最看重) =====
-            # 这里改用 quarterlyEarningsGrowth (最近一季同比) 
-            eps_growth = info.get("earningsQuarterlyGrowth")
-            # 预测增长
-            eps_fwd_growth = info.get("earningsGrowth") 
-
-            # ===== 2. ROE (Minervini 偏好 > 17%) =====
-            roe = info.get("returnOnEquity")
-
-            # ===== 3. 销售增长 (偏好 > 25%) =====
-            revenue_growth = info.get("revenueGrowth")
-
-            # ===== 4. 现金流质量 (FCF/Net Income 也是一种指标) =====
-            fcf = info.get("freeCashflow")
-            ocf = info.get("operatingCashflow")
-            fcf_quality = (fcf / ocf) if (fcf is not None and ocf and ocf > 0) else None
-
-            # ===== 5. 机构持股 (Minervini 也看 Institutional Ownership) =====
-            inst_own = info.get("heldPercentInstitutions")
-
-            # ===== Minervini 风格评分 (严格 Null 检查) =====
-            score = 0
-            # EPS 增长 > 20%
-            if eps_growth and eps_growth > 0.2:
-                score += 1
-            # ROE > 17%
-            if roe and roe > 0.17:
-                score += 1
-            # 销售增长 > 15% (Minervini 实战中通常要求 25%)
-            if revenue_growth and revenue_growth > 0.15:
-                score += 1
-            # 自由现金流健康
-            if fcf_quality and fcf_quality > 0.8:
-                score += 1
-            # 机构持股正在增加 (辅助分)
-            if inst_own and inst_own > 0.3:
-                score += 0.5
-
-            results.append({
-                "stock_code": symbol,
-                "eps_growth": eps_growth,
-                "eps_fwd_growth": eps_fwd_growth,
-                "roe": roe,
-                "revenue_growth": revenue_growth,
-                "fcf_quality": fcf_quality,
-                "inst_own": inst_own,
-                "fundamental_score": score
-            })
-
-            # Yahoo Finance 比较敏感，建议间隔稍微拉长，或者对于 Stage 2 结果集很大时考虑异步
-            time.sleep(0.5) 
-
-        except Exception as e:
-            print(f"❌ {symbol} 基本面获取失败: {e}")
-
-    return pd.DataFrame(results)
 
 
 def build_stage3_fundamental_fast(stage2_df: pd.DataFrame) -> pd.DataFrame:
@@ -751,6 +681,12 @@ def get_latest_date_in_db():
 # 第 5-10 天如果利润达到 5-8%，将止损移至成本价（确保不亏）。
 # 第 10-40 天观察 10日均线 (MA10)。只要收盘价不破 MA10，就一直持有。
 # 卖出信号跌破关键均线或 RS Rank 掉出前 70 名。
+
+# ===================== 配置 =====================
+# 填写你当前持仓或重点观察的股票
+CURRENT_SELECTED_TICKERS = ["CDE", "CSTM", "MLI"]
+# ===============================================
+
 # ===================== 主流程 =====================
 def main():
     init_db()
@@ -774,8 +710,8 @@ def main():
         return
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
-    print("🚀 Stage 2: SwingTrend 技术筛选")
-    stage2 = build_stage2_swingtrend(latest_date_in_db)
+    print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
+    stage2 = build_stage2_swingtrend(latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS)
     print(f"Stage 2 股票数量: {len(stage2)}")
 
     if stage2.empty:
@@ -789,9 +725,11 @@ def main():
 
     # 合并结果
     final = stage2.merge(stage3, on="stock_code", how="left")
-
     # 填充缺失的基本面分数为 0，防止 query 报错
     final["fundamental_score"] = final["fundamental_score"].fillna(0)
+
+    # 5. 标记来源（可选：方便你在结果中区分哪些是买入的，哪些是新选出的）
+    final["is_current_hold"] = final["stock_code"].apply(lambda x: "✅" if x in CURRENT_SELECTED_TICKERS else "❌")
 
     # 过滤与排序
     # 💡 注意：如果你放宽了条件，这里的 fundamental_score >= 3 可能又会把结果过滤成 0
@@ -802,13 +740,14 @@ def main():
     final_filtered = (
         final
         .query("fundamental_score >= 0") # 先改成 0 跑通流程
-        .sort_values(["fundamental_score", "rs_rank"], ascending=False)
+        .sort_values(["fundamental_score", "rs_rank", "is_current_hold"], ascending=False)
         .head(20)
     )
 
     # 7️⃣ 最终买入候选
     print("✅ 最终买入候选")
-    print(final[[
+    print(final_filtered[[
+        "is_current_hold", 
         "stock_code",
         "rs_rank",
         "fundamental_score",
@@ -819,7 +758,7 @@ def main():
     ]])
 
     file = f"final_swingtrend_buy_list_{datetime.now():%Y%m%d}.csv"
-    final.to_csv(file, index=False)
+    final_filtered.to_csv(file, index=False, encoding="utf-8-sig")
     print(f"✅ 结果导出到文件: {file}")
 
 if __name__ == "__main__":
