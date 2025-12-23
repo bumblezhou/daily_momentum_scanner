@@ -7,7 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import urllib3
 import warnings
-from datetime import date
+import pytz
+from datetime import date, datetime, timedelta
+import pandas_market_calendars as mcal
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -76,6 +78,8 @@ def fetch_us_tickers():
 
 
 def upsert_stock_tickers(df):
+    init_db()
+
     con = duckdb.connect(DUCKDB_PATH)
 
     df = df[[
@@ -103,7 +107,7 @@ def download_price_batch(tickers):
     try:
         data = yf.download(
             tickers=tickers,
-            period="1y",
+            period="3y",
             interval="1d",
             group_by="ticker",
             auto_adjust=True, # 复权价格
@@ -195,27 +199,29 @@ def fetch_all_prices():
 
 
 # 获取 US 市场节假日 & 最近 N 个交易日
-def get_recent_trading_days(n=10):
-    url = f"https://finnhub.io/api/v1/stock/market-holiday?exchange=US&token={FINNHUB_TOKEN}"
-    r = requests.get(url, proxies=PROXIES, timeout=30, verify=False)
-    r.raise_for_status()
-    data = r.json()
-
-    holidays = set()
-    for item in data.get("data", []):
-        holidays.add(pd.to_datetime(item["atDate"]).date())
-
-    today = pd.Timestamp.today().date()
-    trading_days = []
-
-    d = today
-    while len(trading_days) < n:
-        if d.weekday() < 5 and d not in holidays:
-            trading_days.append(d)
-        d -= pd.Timedelta(days=1)
-
-    trading_days.reverse()
-    return trading_days
+def get_recent_trading_days_smart(n=10):
+    """
+    使用真实的纽交所(NYSE)日历获取最近交易日
+    """
+    nyse = mcal.get_calendar('NYSE')
+    tz_ny = pytz.timezone('America/New_York')
+    now_ny = datetime.now(tz_ny)
+    
+    # 设定查询范围：从 30 天前到今天
+    # 考虑到上海中午运行美股还没开盘/刚收盘，终点设为美东今天
+    end_date = now_ny.date()
+    start_date = end_date - timedelta(days=30)
+    
+    # 获取纽交所实际开盘的日期表（自动排除周末和美股法定节假日）
+    schedule = nyse.schedule(start_date=start_date, end_date=end_date)
+    
+    # 获取已完成交易的日期列表（排除掉还没收盘的今天，除非已经在美东17:00后）
+    valid_days = schedule.index.date
+    if now_ny.hour < 17:
+        # 如果美东还没到下午5点，当天的K线可能还没封装好，取到昨天为止
+        valid_days = [d for d in valid_days if d < now_ny.date()]
+        
+    return [d.strftime('%Y-%m-%d') for d in valid_days[-n:]]
 
 
 # 找出「最近交易日有缺失行情」的 ticker
@@ -288,15 +294,21 @@ def yahoo_to_finnhub(symbol: str) -> str:
 
 # 用 yfinance 批量补齐最近 10 个交易日行情（20 支一批）
 def update_recent_prices():
-    print("📅 计算最近交易日...")
-    trading_days = get_recent_trading_days(10)
-    print("最近交易日：", trading_days)
+    print(f"🕒 当前上海时间: {datetime.now():%Y-%m-%d %H:%M}")
+    
+    # 1. 自动根据 NYSE 日历获取最近 10 个有效交易日
+    # 这里面已经自动排除了周末、圣诞节、感恩节等
+    trading_days = get_recent_trading_days_smart(10)
+    print(f"📅 纽交所最近有效交易日：{trading_days}")
+    
+    target_date = trading_days[-1]
+    print(f"🎯 目标同步日期: {target_date}")
 
-    print("🔍 查找缺失行情的 ticker...")
+    # 2. 检查数据库缺失
     raw_tickers = get_tickers_missing_recent_data(trading_days)
 
     if not raw_tickers:
-        print("✅ 无需更新")
+        print(f"✅ 数据库已是最新（美东 {target_date} 已对齐），跳过更新")
         return
 
     yahoo_map = {t: finnhub_to_yahoo(t) for t in raw_tickers}
@@ -528,8 +540,8 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
                 AND a.atr10 < a.atr50
 
                 /* ===== Pivot 放量突破 ===== */
-                AND b.close > p.pivot_price
-                AND v.volume >= 1.5 * v.vol50     -- 放量倍数（可调）
+                AND b.close > p.pivot_price * 0.99
+                AND v.volume >= 1.2 * v.vol50     -- 放量倍数（可调）
             )
             OR
             -- 新增：如果是自选股，强制通过筛选
@@ -556,7 +568,7 @@ def build_stage3_fundamental_fast(stage2_df: pd.DataFrame) -> pd.DataFrame:
     con.register("tmp_stage2", stage2_df)
     
     ticker_list = stage2_df["stock_code"].unique().tolist()
-    update_fundamentals(con, ticker_list)
+    update_fundamentals(con, ticker_list, force_update=True)
 
     sql = """
         SELECT 
@@ -676,6 +688,68 @@ def get_latest_date_in_db():
     con.close()
     return latest_date_in_db
 
+
+# ==================== 新增：回撤深度与波动模拟函数 ====================
+def simulate_pullback_range(stock_code, current_vix=18.0):
+    """
+    基于 ATR、历史回撤及 VIX 动态调节因子模拟入场区间与硬止损
+    :param stock_code: 股票代码
+    :param current_vix: 当前市场 VIX 指数，默认 18.0 (基准均值)
+    """
+    con = duckdb.connect(DUCKDB_PATH)
+    
+    # 从数据库获取最近 20 个交易日数据
+    sql = f"""
+        SELECT trade_date, open, high, low, close 
+        FROM stock_price 
+        WHERE stock_code = '{stock_code}' 
+        ORDER BY trade_date DESC 
+        LIMIT 20
+    """
+    try:
+        df = con.execute(sql).df().sort_values('trade_date')
+        con.close()
+        if len(df) < 15:
+            return None
+    except Exception as e:
+        print(f"提取 {stock_code} 波动数据失败: {e}")
+        return None
+
+    # --- A. 计算 15日 ATR (真实波幅) ---
+    high_low = df['high'] - df['low']
+    high_prev_close = (df['high'] - df['close'].shift(1)).abs()
+    low_prev_close = (df['low'] - df['close'].shift(1)).abs()
+    tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+    atr_15 = tr.tail(15).mean()
+
+    # --- B. 计算 VIX 调节因子 (关键优化) ---
+    # 理论依据：VIX 越高，市场非理性波动越大，需要更宽的止损垫
+    # 基准 VIX 设为 18，每高出 1 点，波动空间放大 5%
+    vix_factor = 1.0
+    if current_vix > 18:
+        vix_factor = 1 + (current_vix - 18) * 0.05
+        vix_factor = min(vix_factor, 1.8)  # 最高限制在 1.8 倍，防止止损过深
+
+    current_price = df['close'].iloc[-1]
+    
+    # --- C. 计算动态水位 ---
+    # 理想入场位：价格回调 0.6 倍 ATR (经 VIX 修正)
+    pullback_dist = atr_15 * 0.6 * vix_factor
+    entry_low = current_price - pullback_dist
+    entry_high = current_price * 0.99  # 至少等待 1% 的回调以避免追涨
+
+    # 硬止损位：1.5 倍 ATR (经 VIX 修正)，防扫单
+    stop_dist = atr_15 * 1.5 * vix_factor
+    hard_stop = current_price - stop_dist
+
+    return {
+        'ideal_entry': f"{entry_low:.2f} - {entry_high:.2f}",
+        'hard_stop': round(hard_stop, 2),
+        'atr_15': round(atr_15, 2),
+        'vix_adj': round(vix_factor, 2)
+    }
+
+
 # 3-40 天周期的操作建议在 SwingTrend 系统中，这个周期的操作核心是**“止损上移”**：
 # 时间点动作第 1 天突破 Pivot Point 买入，止损设在 -5%。
 # 第 5-10 天如果利润达到 5-8%，将止损移至成本价（确保不亏）。
@@ -685,12 +759,11 @@ def get_latest_date_in_db():
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
 CURRENT_SELECTED_TICKERS = ["CDE", "CSTM", "MLI"]
+# CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
 # ===================== 主流程 =====================
 def main():
-    init_db()
-
     # 1️⃣ State 1: A, Finnhub ticker
     # 首次执行时解开注释执行，以后每天轮动不用再执行
     # ticker_df = fetch_us_tickers()
@@ -701,6 +774,7 @@ def main():
     # fetch_all_prices()
 
     # 3️⃣ State 1: C, 每天只需更新最新的股票价格数据即可
+    print(f"🚀 Stage 1: 更新最新的股票价格数据")
     update_recent_prices()
 
     # 🚀 修复点：自动获取库中最新的交易日期
@@ -744,22 +818,42 @@ def main():
         .head(20)
     )
 
-    # 7️⃣ 最终买入候选
-    print("✅ 最终买入候选")
-    print(final_filtered[[
-        "is_current_hold", 
-        "stock_code",
-        "rs_rank",
-        "fundamental_score",
-        "eps_acceleration",
-        "roe",
-        "revenue_growth",
-        "fcf_quality"
-    ]])
+    # 7️⃣ 获取实时 VIX 作为调节因子
+    print("\n🔍 正在获取市场 VIX 数据以调节波动区间...")
+    try:
+        vix_df = yf.download("^VIX", period="1d", progress=False, proxy=PROXIES["http"])
+        # 获取最新 VIX 收盘价，若失败则取默认值 18.0
+        current_vix = vix_df['Close'].iloc[-1] if not vix_df.empty else 18.0
+        if isinstance(current_vix, pd.Series): current_vix = current_vix.iloc[0]
+        print(f"当前 VIX 指数: {current_vix:.2f} (调节系数: {max(1.0, 1+(current_vix-18)*0.05):.2f}x)")
+    except Exception as e:
+        print(f"VIX 获取失败，使用基准值: {e}")
+        current_vix = 18.0
 
-    file = f"final_swingtrend_buy_list_{datetime.now():%Y%m%d}.csv"
-    final_filtered.to_csv(file, index=False, encoding="utf-8-sig")
-    print(f"✅ 结果导出到文件: {file}")
+    # 8️⃣ 注入回撤模拟数据
+    print("🛠️ 正在计算个股波动容错区间...")
+    pullback_list = []
+    for ticker in final_filtered['stock_code']:
+        p_data = simulate_pullback_range(ticker, current_vix=current_vix)
+        pullback_list.append(p_data if p_data else {})
+    
+    # 合并模拟结果
+    pullback_df = pd.DataFrame(pullback_list)
+    final_with_sim = pd.concat([final_filtered.reset_index(drop=True), pullback_df], axis=1)
+
+    # 9️⃣ 最终打印输出
+    print("\n✅ 最终买入候选及波动模拟 (含 VIX 调节)")
+    print("-" * 150)
+    display_cols = [
+        "is_current_hold", "stock_code", "close", 
+        "ideal_entry", "hard_stop", "vix_adj", "rs_rank", "fundamental_score"
+    ]
+    print(final_with_sim[display_cols].to_string(index=False))
+
+    # 保存结果
+    file_name = f"swing_strategy_vix_sim_{datetime.now():%Y%m%d}.csv"
+    final_with_sim.to_csv(file_name, index=False, encoding="utf-8-sig")
+    print(f"\n📊 详细策略报告已生成: {file_name}")
 
 if __name__ == "__main__":
     main()
