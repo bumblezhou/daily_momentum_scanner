@@ -617,7 +617,8 @@ def init_fundamental_table(con):
             shares_outstanding BIGINT,                -- S: 流通股本（sharesOutstanding）
             inst_ownership DOUBLE,                    -- I: 机构持仓比例（heldPercentInstitutions）
             fcf_quality DOUBLE,                       -- 自由现金流质量（fcf / ocf）
-            canslim_score INTEGER                     -- CAN SLIM 综合得分（代码中计算）
+            canslim_score INTEGER,                    -- CAN SLIM 综合得分（代码中计算）
+            market_cap BIGINT                         -- 市值（marketCap）
         );
     """)
 
@@ -652,6 +653,9 @@ def update_fundamentals(con, ticker_list, force_update=False):
         try:
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
+
+            # --- 金律字段提取 ---
+            market_cap = info.get('marketCap', 0) or 0
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
@@ -676,12 +680,12 @@ def update_fundamentals(con, ticker_list, force_update=False):
             # 使用 UPSERT 逻辑
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol, datetime.now().date(), quarterly_eps_growth, annual_eps_growth, 
-                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score
+                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
             ))
-            
+
             print(f"  [OK] {symbol} (CAN SLIM Score: {score})")
             time.sleep(0.5)  # 频率控制
 
@@ -800,7 +804,7 @@ def main():
         print("❌ 今日无符合技术面筛选的股票，程序结束。")
         return # 或者保存一个空结果
 
-    # 6️⃣ Stage 3: 基本面分析
+    # 5️⃣ Stage 3: 基本面分析
     print("📊 Stage 3: 基本面分析")
     stage3 = build_stage3_fundamental_fast(stage2)
     # stage3 = build_stage3_fundamental(stage2)
@@ -810,7 +814,7 @@ def main():
     # 填充缺失的基本面分数为 0，防止 query 报错
     final["canslim_score"] = final["canslim_score"].fillna(0)
 
-    # 5. 标记来源（可选：方便你在结果中区分哪些是买入的，哪些是新选出的）
+    # 标记来源（可选：方便你在结果中区分哪些是买入的，哪些是新选出的）
     final["is_current_hold"] = final["stock_code"].apply(lambda x: "✅" if x in CURRENT_SELECTED_TICKERS else "❌")
 
     # 过滤与排序
@@ -826,7 +830,7 @@ def main():
         .head(20)
     )
 
-    # 7️⃣ 获取实时 VIX 作为调节因子
+    # 6️⃣ 波动模拟 (VIX 调节)
     print("\n🔍 正在获取市场 VIX 数据以调节波动区间...")
     try:
         vix_df = yf.download("^VIX", period="1d", progress=False, proxy=PROXIES["http"])
@@ -838,7 +842,7 @@ def main():
         print(f"VIX 获取失败，使用基准值: {e}")
         current_vix = 18.0
 
-    # 8️⃣ 注入回撤模拟数据
+    # 注入回撤模拟数据
     print("🛠️ 正在计算个股波动容错区间...")
     pullback_list = []
     for ticker in final_filtered['stock_code']:
@@ -849,7 +853,7 @@ def main():
     pullback_df = pd.DataFrame(pullback_list)
     final_with_sim = pd.concat([final_filtered.reset_index(drop=True), pullback_df], axis=1)
 
-    # 9️⃣ 最终打印输出
+    # 7️⃣ 最终打印输出
     print("\n✅ 最终买入候选及波动模拟 (含 VIX 调节)")
     print("-" * 150)
     display_cols = [

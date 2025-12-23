@@ -375,7 +375,7 @@ def update_recent_prices():
 
 # 创建基本面数据表结构（扩展为 CAN SLIM 字段）
 def init_fundamental_table(con):
-    """初始化基本面数据表，添加 CAN SLIM 相关字段"""
+    """初始化基本面数据表"""
     con.execute("""
         CREATE TABLE IF NOT EXISTS stock_fundamentals (
             stock_code VARCHAR PRIMARY KEY,           -- 股票代码，主键
@@ -387,7 +387,8 @@ def init_fundamental_table(con):
             shares_outstanding BIGINT,                -- S: 流通股本（sharesOutstanding）
             inst_ownership DOUBLE,                    -- I: 机构持仓比例（heldPercentInstitutions）
             fcf_quality DOUBLE,                       -- 自由现金流质量（fcf / ocf）
-            canslim_score INTEGER                     -- CAN SLIM 综合得分（代码中计算）
+            canslim_score INTEGER,                    -- CAN SLIM 综合得分（代码中计算）
+            market_cap BIGINT                         -- 市值（marketCap）
         );
     """)
 
@@ -422,6 +423,9 @@ def update_fundamentals(con, ticker_list, force_update=False):
         try:
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
+
+            # --- 金律字段提取 ---
+            market_cap = info.get('marketCap', 0) or 0
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
@@ -446,12 +450,12 @@ def update_fundamentals(con, ticker_list, force_update=False):
             # 使用 UPSERT 逻辑
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol, datetime.now().date(), quarterly_eps_growth, annual_eps_growth, 
-                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score
+                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
             ))
-            
+
             print(f"  [OK] {symbol} (CAN SLIM Score: {score})")
             time.sleep(0.5)  # 频率控制
 

@@ -386,7 +386,8 @@ def init_fundamental_table(con):
             shares_outstanding BIGINT,                -- S: 流通股本（sharesOutstanding）
             inst_ownership DOUBLE,                    -- I: 机构持仓比例（heldPercentInstitutions）
             fcf_quality DOUBLE,                       -- 自由现金流质量（fcf / ocf）
-            canslim_score INTEGER                     -- CAN SLIM 综合得分（代码中计算）
+            canslim_score INTEGER,                    -- CAN SLIM 综合得分（代码中计算）
+            market_cap BIGINT                         -- 市值（marketCap）
         );
     """)
 
@@ -421,6 +422,9 @@ def update_fundamentals(con, ticker_list, force_update=False):
         try:
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
+
+            # --- 金律字段提取 ---
+            market_cap = info.get('marketCap', 0) or 0
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
@@ -445,12 +449,12 @@ def update_fundamentals(con, ticker_list, force_update=False):
             # 使用 UPSERT 逻辑
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol, datetime.now().date(), quarterly_eps_growth, annual_eps_growth, 
-                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score
+                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
             ))
-            
+
             print(f"  [OK] {symbol} (CAN SLIM Score: {score})")
             time.sleep(0.5)  # 频率控制
 
@@ -532,17 +536,24 @@ def filter_dip_stocks_from_db(target_date_str: str):
     实现突破回踩策略：
     A. 寻找前40日最高收盘价作为支撑位
     B. 验证当日回踩条件（条件1, 2, 3）
+    美股中小盘金律：
+    ① 股价 > $5
+    ② 日成交额 > $200万 (50日均值)
     """
     con = duckdb.connect(DUCKDB_PATH)
     
     # 定义回踩参数
-    VOLATILITY_LIMIT = 0.05       # 条件3：波动性限制
-    SUPPORT_TOLERANCE = 0.995     # 条件1：最低价容差因子
+    VOLATILITY_LIMIT = 0.05         # 条件3：波动性限制
+    SUPPORT_TOLERANCE = 0.995       # 条件1：最低价容差因子
+    MIN_PRICE = 5.0                 # 金律①：股价门槛
+    MIN_DOLLAR_VOLUME = 2000000     # 金律②：成交额门槛 (200万美元)
     
     sql = f"""
     WITH DailyData AS (
         SELECT 
             stock_code, trade_date, close, high, low, volume,
+            -- 计算50日平均成交额 (Close * Volume)
+            AVG(close * volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 50 PRECEDING) as avg_dollar_volume,
             (high - low) / NULLIF(LAG(close) OVER (PARTITION BY stock_code ORDER BY trade_date), 0) as amplitude
         FROM stock_price
         WHERE trade_date <= '{target_date_str}'
@@ -557,6 +568,10 @@ def filter_dip_stocks_from_db(target_date_str: str):
         SELECT *
         FROM SupportLevel
         WHERE trade_date = '{target_date_str}'
+          -- 金律检查 ① 股价门槛
+          AND close >= {MIN_PRICE}
+          -- 金律检查 ② 成交额门槛
+          AND avg_dollar_volume >= {MIN_DOLLAR_VOLUME}
           -- 条件1：最高价和最低价*99.5%包含支持价
           AND high >= support_price 
           AND (low * {SUPPORT_TOLERANCE}) <= support_price
@@ -624,27 +639,34 @@ def main():
         print("❌ 未发现符合条件的股票。")
         return
 
-    # 2️⃣ 针对候选股更新基本面 (仅更新这几只，速度极快)
+    # 5️⃣ 针对候选股更新基本面 (仅更新这几只，速度极快)
     print(f"🚀 Step 2: 更新 {len(stage2_df)} 只候选股的基本面及子项...")
     con = duckdb.connect(DUCKDB_PATH)
     update_fundamentals(con, stage2_df['stock_code'].tolist(), force_update=True)
     
-    # 3️⃣ 计算 RS Rank 和获取 CAN SLIM 分数
+    # 6️⃣ 计算 RS Rank 和获取 CAN SLIM 分数
     print("🚀 Step 3: 计算全市场 RS Rank 并关联基本面分数...")
     # 计算 RS Rank
     final_df = calculate_rs_rank_for_candidates(stage2_df, target_date_str)
     
-    # 关联基本面分数
-    fund_sql = """
-        SELECT stock_code, canslim_score, quarterly_eps_growth, annual_eps_growth, 
-               inst_ownership, roe, revenue_growth 
+    # 关联基本面数据并应用 金律③ 和 市值区间
+    MIN_MARKET_CAP = 300_000_000    # 3亿美元
+    MAX_MARKET_CAP = 5_000_000_000  # 建议放宽到50亿美元以覆盖更多类似A股的高质股
+    MIN_INST_OWN = 30.0             # 金律③：机构持仓 > 30%
+
+    # 7️⃣ 关联基本面分数
+    fund_sql = f"""
+        SELECT stock_code, canslim_score, quarterly_eps_growth, inst_ownership, market_cap
         FROM stock_fundamentals
+        WHERE market_cap BETWEEN {MIN_MARKET_CAP} AND {MAX_MARKET_CAP}
+          AND inst_ownership >= {MIN_INST_OWN}
     """
+    fundamentals_df = con.execute(fund_sql).df()
     fundamentals_df = con.execute(fund_sql).df()
     final_df = pd.merge(final_df, fundamentals_df, on='stock_code', how='left')
     con.close()
 
-    # 4️⃣ 波动模拟 (VIX 调节)
+    # 8️⃣ 波动模拟 (VIX 调节)
     print("\n🔍 正在获取市场 VIX 数据以调节波动区间...")
     try:
         vix_df = yf.download("^VIX", period="1d", progress=False, proxy=PROXIES["http"])
@@ -656,7 +678,7 @@ def main():
         print(f"VIX 获取失败，使用基准值: {e}")
         current_vix = 18.0
 
-    # 5️⃣ 注入回撤模拟数据
+    # 注入回撤模拟数据
     print("🛠️ 正在计算个股波动容错区间...")
     pullback_list = []
     for ticker in final_df['stock_code']:
@@ -667,7 +689,7 @@ def main():
     pullback_df = pd.DataFrame(pullback_list)
     final_with_sim = pd.concat([final_df.reset_index(drop=True), pullback_df], axis=1)
 
-    # 6️⃣ 打印输出
+    # 9️⃣ 打印输出
     display_cols = [
         "stock_code", "close", "support_price", "rs_rank", "canslim_score",
         "quarterly_eps_growth", "annual_eps_growth", "inst_ownership", "ideal_entry"
