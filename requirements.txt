@@ -14,3 +14,7 @@ urllib3==1.26.20
 
 # Excel 导出支持 (用于处理特殊符号和 .xlsx 格式)
 openpyxl==3.1.5
+
+# 交易所日历
+pytz==2025.2
+pandas_market_calendars==5.2.2
