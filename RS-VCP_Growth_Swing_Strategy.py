@@ -464,7 +464,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         FROM atr_raw
     ),
 
-    /* ===== Pivot（最近 20 日高点） ===== */
+    /* ===== Pivot（最近 40 日高点） ===== */
     /* 修正点：重命名 CTE 为 pivot_data 避免关键字冲突 */
     pivot_data AS (
         SELECT
@@ -474,7 +474,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
             MAX(high) OVER (
                 PARTITION BY stock_code
                 ORDER BY trade_date
-                ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+                ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING
             ) AS pivot_price
         FROM stock_price
     ),
