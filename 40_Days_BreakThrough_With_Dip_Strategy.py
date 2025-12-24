@@ -179,6 +179,7 @@ def fetch_all_prices():
         WHERE type = 'Common Stock' AND mic IN (
             'XNYS',
             'XNGS',
+            'XNAS',
             'XASE',
             'ARCX',
             'BATS',
@@ -225,33 +226,24 @@ def get_recent_trading_days_smart(n=10):
 
 
 # 找出「最近交易日有缺失行情」的 ticker
-def get_tickers_missing_recent_data(trading_days):
+def get_tickers_missing_recent_data(target_date):
     """
     返回尚未更新到最近一个交易日的 ticker 列表
     """
-    latest_trading_day = trading_days[-1]
-
     con = duckdb.connect(DUCKDB_PATH)
 
     query = f"""
         SELECT t.symbol
         FROM stock_ticker t
         LEFT JOIN (
-            SELECT
-                stock_code,
-                MAX(trade_date) AS last_trade_date
+            SELECT stock_code, MAX(trade_date) AS last_date
             FROM stock_price
             GROUP BY stock_code
-        ) p
-        ON p.stock_code = t.symbol
-        WHERE
-            t.type = 'Common Stock'
-            AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
-            AND COALESCE(t.yf_price_available, TRUE) = TRUE
-            AND (
-                p.last_trade_date IS NULL
-                OR p.last_trade_date < DATE '{latest_trading_day}'
-            )
+        ) p ON p.stock_code = t.symbol
+        WHERE t.type = 'Common Stock'
+          AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+          AND COALESCE(t.yf_price_available, TRUE) = TRUE
+          AND (p.last_date IS NULL OR p.last_date < CAST('{target_date}' AS DATE))
     """
 
     tickers = [r[0] for r in con.execute(query).fetchall()]
@@ -305,7 +297,7 @@ def update_recent_prices(watchlist: list = []):
     print(f"🎯 目标同步日期: {target_date}")
 
     # 2. 检查数据库缺失
-    raw_tickers = get_tickers_missing_recent_data(trading_days)
+    raw_tickers = get_tickers_missing_recent_data(target_date)
     if watchlist:
         # 合并自选列表
         raw_tickers = list(set(raw_tickers) | set(watchlist))
@@ -317,7 +309,7 @@ def update_recent_prices(watchlist: list = []):
     yahoo_map = {t: finnhub_to_yahoo(t) for t in raw_tickers}
     yahoo_tickers = list(yahoo_map.values())
 
-    print(f"需要更新 {len(yahoo_tickers)} 只股票")
+    print(f"需要更新 {len(yahoo_tickers)} 只股票: {yahoo_tickers}")
 
     for i in range(0, len(yahoo_tickers), YF_BATCH_SIZE):
         batch = yahoo_tickers[i:i + YF_BATCH_SIZE]
@@ -393,11 +385,13 @@ def init_fundamental_table(con):
 
 
 # 编写“增量更新”脚本（扩展为 CAN SLIM）
-def update_fundamentals(con, ticker_list, force_update=False):
+def update_fundamentals(ticker_list, force_update=False):
     """
     定期更新基本面数据，包括 CAN SLIM 特定指标
     force_update: 是否强制更新所有股票，否则只更新过期数据
     """
+
+    con = duckdb.connect(DUCKDB_PATH)
 
     init_fundamental_table(con)
 
@@ -408,7 +402,7 @@ def update_fundamentals(con, ticker_list, force_update=False):
         # 找出库里没有的，或者更新时间超过 7 天的
         existing = con.execute("""
             SELECT stock_code FROM stock_fundamentals 
-            WHERE update_date > CURRENT_DATE - INTERVAL '7 days'
+            WHERE update_date >= CURRENT_DATE
         """).df()['stock_code'].tolist()
         need_update = [t for t in ticker_list if t not in existing]
 
@@ -461,7 +455,8 @@ def update_fundamentals(con, ticker_list, force_update=False):
         except Exception as e:
             print(f"  [ERR] {symbol} 更新失败: {e}")
             continue
-
+    
+    con.close()
 
 def get_latest_date_in_db():
     con = duckdb.connect(DUCKDB_PATH)
@@ -607,6 +602,34 @@ def calculate_rs_rank_for_candidates(candidates_df, target_date_str):
     con.close()
     return pd.merge(candidates_df, rs_df, on='stock_code', how='left')
 
+# ==================== 给候选股票数据关联上基本面数据 ====================
+def link_fundamental_data(candidates_df):
+    """给候选股票数据关联上基本面数据"""
+    # 关联基本面数据并应用 金律③ 和 市值区间
+    MIN_MARKET_CAP = 300_000_000    # 3亿美元
+    MAX_MARKET_CAP = 5_000_000_000  # 建议放宽到50亿美元以覆盖更多类似A股的高质股
+    MIN_INST_OWN = 0.3             # 金律③：机构持仓 > 30%
+    con = duckdb.connect(DUCKDB_PATH)
+    found_sql = f"""
+        SELECT
+            stock_code, 
+            quarterly_eps_growth, 
+            annual_eps_growth, 
+            revenue_growth, 
+            roe, 
+            shares_outstanding, 
+            inst_ownership, 
+            canslim_score,
+            market_cap
+        FROM stock_fundamentals
+        WHERE market_cap BETWEEN {MIN_MARKET_CAP} AND {MAX_MARKET_CAP}
+          AND inst_ownership >= {MIN_INST_OWN}
+    """
+    fundamentals_df = con.execute(found_sql).df()
+    final_df = pd.merge(candidates_df, fundamentals_df, on='stock_code', how='left')
+    con.close()
+    return final_df
+
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
@@ -641,30 +664,16 @@ def main():
 
     # 5️⃣ 针对候选股更新基本面 (仅更新这几只，速度极快)
     print(f"🚀 Step 2: 更新 {len(stage2_df)} 只候选股的基本面及子项...")
-    con = duckdb.connect(DUCKDB_PATH)
-    update_fundamentals(con, stage2_df['stock_code'].tolist(), force_update=True)
+    update_fundamentals(stage2_df['stock_code'].tolist(), force_update=False)
     
-    # 6️⃣ 计算 RS Rank 和获取 CAN SLIM 分数
-    print("🚀 Step 3: 计算全市场 RS Rank 并关联基本面分数...")
+    # 6️⃣ 计算 RS Rank 
+    print("🚀 Step 3: 计算全市场 RS Rank...")
     # 计算 RS Rank
-    final_df = calculate_rs_rank_for_candidates(stage2_df, target_date_str)
+    candidates_df = calculate_rs_rank_for_candidates(stage2_df, target_date_str)
     
-    # 关联基本面数据并应用 金律③ 和 市值区间
-    MIN_MARKET_CAP = 300_000_000    # 3亿美元
-    MAX_MARKET_CAP = 5_000_000_000  # 建议放宽到50亿美元以覆盖更多类似A股的高质股
-    MIN_INST_OWN = 0.3             # 金律③：机构持仓 > 30%
-
     # 7️⃣ 关联基本面分数
-    fund_sql = f"""
-        SELECT stock_code, canslim_score, quarterly_eps_growth, inst_ownership, market_cap
-        FROM stock_fundamentals
-        WHERE market_cap BETWEEN {MIN_MARKET_CAP} AND {MAX_MARKET_CAP}
-          AND inst_ownership >= {MIN_INST_OWN}
-    """
-    fundamentals_df = con.execute(fund_sql).df()
-    fundamentals_df = con.execute(fund_sql).df()
-    final_df = pd.merge(final_df, fundamentals_df, on='stock_code', how='left')
-    con.close()
+    print("🚀 Step 4: 关联基本面分数...")
+    final_df = link_fundamental_data(candidates_df)
 
     # 8️⃣ 波动模拟 (VIX 调节)
     print("\n🔍 正在获取市场 VIX 数据以调节波动区间...")
@@ -689,19 +698,43 @@ def main():
     pullback_df = pd.DataFrame(pullback_list)
     final_with_sim = pd.concat([final_df.reset_index(drop=True), pullback_df], axis=1)
 
+    # 1. & 2. 定义必须非空的字段并剔除包含 NaN 的行
+    # 包含的字段：quarterly_eps_growth, annual_eps_growth, revenue_growth, roe, shares_outstanding, inst_ownership, canslim_score
+    critical_fundamental_cols = [
+        'quarterly_eps_growth', 'annual_eps_growth', 'revenue_growth', 
+        'roe', 'shares_outstanding', 'inst_ownership', 'canslim_score'
+    ]
+    # 🛠️ 剔除基本面分数为 NaN 的股票
+    # 这会过滤掉那些 yfinance 无法获取财务数据或不符合初步基本面条件的股票
+    before_count = len(final_with_sim)
+    final_with_sim = final_with_sim.dropna(subset=critical_fundamental_cols)
+    after_count = len(final_with_sim)
+    print(f"🧹 已剔除基本面数据不全的股票: {before_count - after_count} 只")
+
     # 9️⃣ 打印输出
     display_cols = [
         "stock_code", "close", "support_price", "rs_rank", "canslim_score",
-        "quarterly_eps_growth", "annual_eps_growth", "inst_ownership", "ideal_entry"
+        "quarterly_eps_growth", "annual_eps_growth", "revenue_growth", 
+        "roe", "shares_outstanding", "inst_ownership", "ideal_entry"
     ]
     # 过滤掉不存在的列以防报错
     actual_cols = [c for c in display_cols if c in final_with_sim.columns]
     print(final_with_sim[actual_cols].to_string(index=False))
 
     # 保存结果
-    file_name = f"40_days_breakthrough_with_dip_{datetime.now():%Y%m%d}.csv"
-    final_with_sim.to_csv(file_name, index=False, encoding="utf-8-sig")
-    print(f"\n📊 详细策略报告已生成: {file_name}")
+    if not final_with_sim.empty:
+        file_name_xlsx = f"40_days_breakthrough_with_dip_{datetime.now():%Y%m%d}.xlsx"
+        try:
+            final_with_sim[actual_cols].to_excel(file_name_xlsx, index=False, engine='openpyxl')
+            print(f"\n📊 详细策略报告已生成 Excel: {file_name_xlsx}")
+        except Exception as e:
+            print(f"❌ Excel 生成失败 (请检查是否安装 openpyxl): {e}")
+            # 备选保存为 CSV
+            file_name_csv = file_name_xlsx.replace(".xlsx", ".csv")
+            final_with_sim.to_csv(file_name_csv, index=False, encoding="utf-8-sig")
+            print(f"\n📊 详细策略报告已生成: {file_name_csv}")
+    else:
+        print("⚠️ 经过基本面严格筛选后，没有符合条件的股票。")
 
 if __name__ == "__main__":
     main()
