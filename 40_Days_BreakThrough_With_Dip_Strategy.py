@@ -556,7 +556,9 @@ def filter_dip_stocks_from_db(target_date_str: str):
     SupportLevel AS (
         SELECT *,
             -- A. 找出交易当天之前40个交易日的最高收盘价 (不含当天)
-            MAX(close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING) as support_price
+            MAX(close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING) as support_price,
+            -- B. 找出最高收盘价对应的日期 (使用 DuckDB 的 arg_max 函数)
+            arg_max(trade_date, close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING) as support_date
         FROM DailyData
     ),
     Filtered AS (
@@ -575,7 +577,8 @@ def filter_dip_stocks_from_db(target_date_str: str):
           -- 条件3：波动性小于 LIMIT
           /* AND amplitude <= {VOLATILITY_LIMIT} */
     )
-    SELECT stock_code, trade_date, close, support_price, amplitude 
+    -- 返回包含回踩日期(trade_date)和支撑位日期(support_date)
+    SELECT stock_code, trade_date, support_date, close, support_price, amplitude 
     FROM Filtered
     """
     result_df = con.execute(sql).df()
@@ -612,13 +615,14 @@ def link_fundamental_data(candidates_df):
     con = duckdb.connect(DUCKDB_PATH)
     found_sql = f"""
         SELECT
-            stock_code, 
-            quarterly_eps_growth, 
-            annual_eps_growth, 
-            revenue_growth, 
-            roe, 
-            shares_outstanding, 
-            inst_ownership, 
+            stock_code,
+            quarterly_eps_growth,
+            annual_eps_growth,
+            revenue_growth,
+            roe,
+            shares_outstanding,
+            inst_ownership,
+            fcf_quality,
             canslim_score,
             market_cap
         FROM stock_fundamentals
@@ -698,25 +702,42 @@ def main():
     pullback_df = pd.DataFrame(pullback_list)
     final_with_sim = pd.concat([final_df.reset_index(drop=True), pullback_df], axis=1)
 
-    # 1. & 2. 定义必须非空的字段并剔除包含 NaN 的行
+    # 1. 定义需要保留2位小数的浮点数列名（根据实际列名调整）
+    float_cols = [
+        'close', 'support_price', 'quarterly_eps_growth', 'annual_eps_growth', 
+        'revenue_growth', 'roe', 'inst_ownership', 'fcf_quality'
+    ]
+    
+    # 2. 统一保留两位小数
+    # 自动识别 DataFrame 中存在的浮点数列并取2位小数
+    final_with_sim = final_with_sim.round(2)
+
+    # 3. 定义必须非空的字段并剔除包含 NaN 的行
     # 包含的字段：quarterly_eps_growth, annual_eps_growth, revenue_growth, roe, shares_outstanding, inst_ownership, canslim_score
     critical_fundamental_cols = [
         'quarterly_eps_growth', 'annual_eps_growth', 'revenue_growth', 
-        'roe', 'shares_outstanding', 'inst_ownership', 'canslim_score'
+        'roe', 'shares_outstanding', 'inst_ownership', "fcf_quality", 'canslim_score'
     ]
-    # 🛠️ 剔除基本面分数为 NaN 的股票
+    # 4. 剔除基本面分数为 NaN 的股票
     # 这会过滤掉那些 yfinance 无法获取财务数据或不符合初步基本面条件的股票
     before_count = len(final_with_sim)
     final_with_sim = final_with_sim.dropna(subset=critical_fundamental_cols)
     after_count = len(final_with_sim)
     print(f"🧹 已剔除基本面数据不全的股票: {before_count - after_count} 只")
 
+    # 5. 确保日期格式美化（可选，防止 Excel 里显示长字符串）
+    if 'trade_date' in final_with_sim.columns:
+        final_with_sim['trade_date'] = pd.to_datetime(final_with_sim['trade_date']).dt.strftime('%Y-%m-%d')
+    if 'support_date' in final_with_sim.columns:
+        final_with_sim['support_date'] = pd.to_datetime(final_with_sim['support_date']).dt.strftime('%Y-%m-%d')
+
     # 9️⃣ 打印输出
     display_cols = [
-        "stock_code", "close", "support_price", "rs_rank", "canslim_score",
-        "quarterly_eps_growth", "annual_eps_growth", "revenue_growth", 
-        "roe", "shares_outstanding", "inst_ownership", "ideal_entry"
+        "stock_code", "trade_date", "support_date","close", "support_price", "rs_rank", 
+        "canslim_score", "quarterly_eps_growth", "annual_eps_growth", "revenue_growth", 
+        "roe", "shares_outstanding", "inst_ownership", "fcf_quality", "ideal_entry"
     ]
+    
     # 过滤掉不存在的列以防报错
     actual_cols = [c for c in display_cols if c in final_with_sim.columns]
     print(final_with_sim[actual_cols].to_string(index=False))
