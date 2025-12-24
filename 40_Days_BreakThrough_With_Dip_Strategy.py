@@ -723,7 +723,7 @@ def main():
 
     # 保存结果
     if not final_with_sim.empty:
-        file_name_xlsx = f"40_days_breakthrough_with_dip_{datetime.now():%Y%m%d}.xlsx"
+        file_name_xlsx = f"fourty_days_breakthrough_with_dip_{datetime.now():%Y%m%d}.xlsx"
         try:
             final_with_sim[actual_cols].to_excel(file_name_xlsx, index=False, engine='openpyxl')
             print(f"\n📊 详细策略报告已生成 Excel: {file_name_xlsx}")
