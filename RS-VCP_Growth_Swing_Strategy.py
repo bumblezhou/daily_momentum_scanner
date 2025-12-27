@@ -573,27 +573,21 @@ def build_stage3_fundamental_fast(stage2_df: pd.DataFrame) -> pd.DataFrame:
     ticker_list = stage2_df["stock_code"].unique().tolist()
     update_fundamentals(con, ticker_list, force_update=True)
 
-    sql = """
-        SELECT 
-            s2.*,
-            f.quarterly_eps_growth,
-            f.roe,
-            f.canslim_score
-        FROM tmp_stage2 s2
-        LEFT JOIN stock_fundamentals f ON s2.stock_code = f.stock_code
-        ORDER BY s2.rs_rank DESC, f.canslim_score DESC
-    """
     # 💡 核心修正：只选择基本面相关的列 + 关联主键
     sql = """
         SELECT 
             f.stock_code,
             f.canslim_score,
-            f.quarterly_eps_growth AS eps_acceleration, -- 对应你 final 打印时的字段名
+            f.quarterly_eps_growth,
+            f.annual_eps_growth,
             f.roe,
             f.revenue_growth,
-            f.fcf_quality
+            f.fcf_quality,
+            f.shares_outstanding,
+            f.inst_ownership,
+            f.market_cap
         FROM stock_fundamentals f
-        WHERE f.stock_code IN (SELECT stock_code FROM tmp_stage2)
+        WHERE f.stock_code IN (SELECT stock_code FROM tmp_stage2) AND f.fcf_quality IS NOT NULL AND f.roe IS NOT NULL
     """
     
     result_df = con.execute(sql).df()
@@ -639,7 +633,7 @@ def update_fundamentals(con, ticker_list, force_update=False):
         # 找出库里没有的，或者更新时间超过 7 天的
         existing = con.execute("""
             SELECT stock_code FROM stock_fundamentals 
-            WHERE update_date > CURRENT_DATE - INTERVAL '7 days'
+            WHERE update_date >= CURRENT_DATE
         """).df()['stock_code'].tolist()
         need_update = [t for t in ticker_list if t not in existing]
 
@@ -648,9 +642,16 @@ def update_fundamentals(con, ticker_list, force_update=False):
         return
 
     print(f"🚀 开始更新 {len(need_update)} 只股票的基本面...")
-
     for symbol in need_update:
         try:
+            fundamentals_sql = f"""
+                SELECT stock_code FROM stock_fundamentals WHERE update_date >= CURRENT_DATE AND stock_code = '{symbol}'
+            """
+            fundamentals_sql_df = con.execute(fundamentals_sql).df()
+            if not fundamentals_sql_df.empty:
+                print(f"  [跳过] {symbol} 基本面数据在有效期内")
+                continue
+
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
 
@@ -680,10 +681,9 @@ def update_fundamentals(con, ticker_list, force_update=False):
             # 使用 UPSERT 逻辑
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                symbol, datetime.now().date(), quarterly_eps_growth, annual_eps_growth, 
-                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
+                symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
             ))
 
             print(f"  [OK] {symbol} (CAN SLIM Score: {score})")
@@ -853,6 +853,12 @@ def main():
     pullback_df = pd.DataFrame(pullback_list)
     final_with_sim = pd.concat([final_filtered.reset_index(drop=True), pullback_df], axis=1)
 
+    # 确保日期格式美化（可选，防止 Excel 里显示长字符串）
+    if 'trade_date' in final_with_sim.columns:
+        final_with_sim['trade_date'] = pd.to_datetime(final_with_sim['trade_date']).dt.strftime('%Y-%m-%d')
+    # 自动识别 DataFrame 中存在的浮点数列并取2位小数
+    final_with_sim = final_with_sim.round(2)
+
     # 7️⃣ 最终打印输出
     print("\n✅ 最终买入候选及波动模拟 (含 VIX 调节)")
     print("-" * 150)
@@ -863,9 +869,19 @@ def main():
     print(final_with_sim[display_cols].to_string(index=False))
 
     # 保存结果
-    file_name = f"swing_strategy_vix_sim_{datetime.now():%Y%m%d}.csv"
-    final_with_sim.to_csv(file_name, index=False, encoding="utf-8-sig")
-    print(f"\n📊 详细策略报告已生成: {file_name}")
+    if not final_with_sim.empty:
+        file_name_xlsx = f"swing_strategy_vix_sim_v2_{datetime.now():%Y%m%d}.xlsx"
+        try:
+            final_with_sim.to_excel(file_name_xlsx, index=False, engine='openpyxl')
+            print(f"\n📊 详细策略报告已生成 Excel: {file_name_xlsx}")
+        except Exception as e:
+            print(f"❌ Excel 生成失败 (请检查是否安装 openpyxl): {e}")
+            # 备选保存为 CSV
+            file_name_csv = file_name_xlsx.replace(".xlsx", ".csv")
+            final_with_sim.to_csv(file_name_csv, index=False, encoding="utf-8-sig")
+            print(f"\n📊 详细策略报告已生成: {file_name_csv}")
+    else:
+        print("⚠️ 经过基本面严格筛选后，没有符合条件的股票。")
 
 if __name__ == "__main__":
     main()
