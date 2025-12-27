@@ -179,6 +179,7 @@ def fetch_all_prices():
         WHERE type = 'Common Stock' AND mic IN (
             'XNYS',
             'XNGS',
+            'XNAS',
             'XASE',
             'ARCX',
             'BATS',
@@ -399,6 +400,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
 
             /* ===== 均线参数（可调） ===== */
             AVG(close) OVER w10  AS ma10,    -- 短线持仓用
+            AVG(close) OVER w20  AS ma20,    -- 新增：用于止损和VCP
             AVG(close) OVER w50  AS ma50,
             AVG(close) OVER w150 AS ma150,
             AVG(close) OVER w200 AS ma200,
@@ -411,6 +413,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         FROM stock_price
         WINDOW
             w10  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING),
+            w20  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING),
             w50  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 49 PRECEDING),
             w150 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 149 PRECEDING),
             w200 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 199 PRECEDING),
@@ -440,20 +443,55 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
     ),
 
-    rs_ranked AS (
+    rs_scores AS (
         SELECT
             stock_code,
             trade_date,
 
-            /* RS 权重（可调） */
-            0.4*r1y + 0.3*r6m + 0.2*r3m + 0.1*r1m AS rs_score,
+            /* 🔥🔥 核心修正：使用 COALESCE 防止 NULL 传染
+               如果数据不足导致 r6m 为空，则视为 0，保证 rs_score 能算出来
+            */
+            (
+                0.4 * COALESCE(r1y, 0) + 
+                0.3 * COALESCE(r6m, 0) + 
+                0.2 * COALESCE(r3m, 0) + 
+                0.1 * COALESCE(r1m, 0)
+            ) AS rs_score,
 
-            /* 全市场百分位排名 */
+            /* 计算排名 */
             PERCENT_RANK() OVER (
                 PARTITION BY trade_date
-                ORDER BY 0.4*r1y + 0.3*r6m + 0.2*r3m + 0.1*r1m
+                ORDER BY (
+                    0.4 * COALESCE(r1y, 0) + 
+                    0.3 * COALESCE(r6m, 0) + 
+                    0.2 * COALESCE(r3m, 0) + 
+                    0.1 * COALESCE(r1m, 0)
+                )
             ) * 100 AS rs_rank
         FROM returns
+    ),
+
+    rs_averages AS (  -- 新 CTE: 计算 rs_20 使用预计算的 rs_score（无嵌套）
+        SELECT
+            *,
+            /* 新增：RS 变化率 - 过去20日RS均值 */
+            AVG(rs_score) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS 19 PRECEDING
+            ) AS rs_20
+        FROM rs_scores
+    ),
+
+    rs_ranked AS (  -- 最终 CTE: 计算 lagged 值使用预计算的 rs_20（无嵌套）
+        SELECT
+            *,
+            /* 10日前 RS_20 */
+            LAG(rs_20, 10) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+            ) AS rs_20_10days_ago
+        FROM rs_averages
     ),
 
     /* ===== ATR（VCP 波动收缩） ===== */
@@ -470,13 +508,28 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
     ),
 
-    atr_stats AS (
+    atr_10day_avg AS (
         SELECT
             stock_code,
             trade_date,
-            AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING)  AS atr10,
-            AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 49 PRECEDING) AS atr50
+            AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING) AS atr10_recent
         FROM atr_raw
+    ),
+
+    atr_stats AS (
+        SELECT
+            a.stock_code,
+            a.trade_date,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 4 PRECEDING)  AS atr5,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 19 PRECEDING) AS atr20,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 14 PRECEDING) AS atr15,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 59 PRECEDING) AS atr60,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 9 PRECEDING)  AS atr10,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 49 PRECEDING) AS atr50,
+            (avg10.atr10_recent -
+             LAG(avg10.atr10_recent, 10) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date)) / 10 AS atr_slope
+        FROM atr_raw a
+        JOIN atr_10day_avg avg10 USING (stock_code, trade_date)
     ),
 
     /* ===== Pivot（最近 40 日高点） ===== */
@@ -503,8 +556,26 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
             AVG(volume) OVER (
                 PARTITION BY stock_code
                 ORDER BY trade_date
+                ROWS 19 PRECEDING  -- 修改为20日均量
+            ) AS vol20,
+            AVG(volume) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
                 ROWS 49 PRECEDING
             ) AS vol50
+        FROM stock_price
+    ),
+
+    /* ===== 前5日最高价 ===== */
+    prev_high AS (
+        SELECT
+            stock_code,
+            trade_date,
+            MAX(high) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
+            ) AS high_5d
         FROM stock_price
     )
 
@@ -513,41 +584,59 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         b.trade_date,
         b.close,
         r.rs_rank,
-        b.ma10, b.ma50, b.ma150, b.ma200,
+        b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
         b.high_52w, b.low_52w,
-        a.atr10, a.atr50,
+        a.atr5, a.atr20, a.atr15, a.atr60, a.atr10, a.atr50,
+        a.atr_slope,
+        r.rs_20, r.rs_20_10days_ago,
         p.pivot_price,
-        v.volume, v.vol50
+        v.volume, v.vol20, v.vol50,
+        ph.high_5d
 
     FROM base b
     JOIN rs_ranked r USING (stock_code, trade_date)
     JOIN atr_stats a USING (stock_code, trade_date)
     JOIN pivot_data p USING (stock_code, trade_date)
     JOIN volume_check v USING (stock_code, trade_date)
+    JOIN prev_high ph USING (stock_code, trade_date)
 
     WHERE
         b.trade_date = DATE '{target_date}'
         AND (
             (
-                /* ===== Trend Template（可调阈值） ===== */
-                b.close > b.ma150
-                AND b.ma150 > b.ma200
-                AND b.ma50  > b.ma150
-                AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
-                AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
+                /* ===== 1. 基础结构：即使去掉了均线，也要保证不是垃圾股 ===== */
+                b.close >= 5.0                -- 股价大于5元，过滤仙股
+                AND b.close >= 1.10 * b.low_52w   -- 放宽：距52周低点至少+10%
+                AND b.close >= 0.70 * b.high_52w  -- 放宽：距52周高点不超过-30%
 
-                /* ===== RS Rank 门槛 ===== */
-                AND r.rs_rank >= 70
+                /* ===== 2. RS 强度：保留，这是核心，但稍微放宽排名 ===== */
+                AND r.rs_rank >= 70           -- 稍微提高排名要求，保证强者恒强
+                /* 注释掉苛刻的RS加速要求，允许RS走平 */
+                -- AND r.rs_20 > r.rs_20_10days_ago 
 
-                /* ===== VCP：波动正在收缩 ===== */
-                AND a.atr10 < a.atr50
+                /* ===== 3. VCP 形态：放宽波动收缩阈值 ===== */
+                /* 将 0.8 放宽到 0.95，只要近期没有剧烈波动即可 */
+                AND (a.atr5 / NULLIF(a.atr20, 0)) < 0.95 
+                
+                /* 注释掉 slope < 0，有时候震荡期 slope 是平的 */
+                -- AND a.atr_slope < 0
+                
+                /* 保留：短期比长期稳定 */
+                AND a.atr15 < a.atr60
 
-                /* ===== Pivot 放量突破 ===== */
-                AND b.close > p.pivot_price * 0.99
-                AND v.volume >= 1.2 * v.vol50     -- 放量倍数（可调）
+                /* ===== 4. 关键修改：移除“当天必须爆发”的条件 ===== */
+                /* 我们要找的是“准备好”的股票，而不是“已经涨完”的股票 */
+                /* AND (
+                    b.close > ph.high_5d
+                    OR b.close > p.pivot_price
+                )
+                AND v.volume >= 1.2 * v.vol20 
+                */
+                
+                /* 替代方案：只要成交量不要已经枯竭到死寂即可，或者完全不限 */
+                AND v.volume > 100000 -- 保证流动性即可
             )
             OR
-            -- 新增：如果是自选股，强制通过筛选
             b.stock_code IN ({monitor_str})
         )
 
@@ -591,9 +680,7 @@ def build_stage3_fundamental_fast(stage2_df: pd.DataFrame) -> pd.DataFrame:
     """
     
     result_df = con.execute(sql).df()
-
     con.close()
-
     return result_df
 
 
@@ -686,9 +773,6 @@ def update_fundamentals(con, ticker_list, force_update=False):
                 symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
             ))
 
-            print(f"  [OK] {symbol} (CAN SLIM Score: {score})")
-            time.sleep(0.5)  # 频率控制
-
         except Exception as e:
             print(f"  [ERR] {symbol} 更新失败: {e}")
             continue
@@ -701,7 +785,7 @@ def get_latest_date_in_db():
     return latest_date_in_db
 
 
-# ==================== 新增：回撤深度与波动模拟函数 ====================
+# ==================== 新增：回撤深度与波动模拟函数（修复版）===================
 def simulate_pullback_range(stock_code, current_vix=18.0):
     """
     基于 ATR、历史回撤及 VIX 动态调节因子模拟入场区间与硬止损
@@ -710,22 +794,32 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
     """
     con = duckdb.connect(DUCKDB_PATH)
     
-    # 从数据库获取最近 20 个交易日数据
+    # 直接在 SQL 中计算所需的 ma20 和 pivot_price（因为原始表没有这些列）
     sql = f"""
-        SELECT trade_date, open, high, low, close 
+        SELECT 
+            trade_date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            AVG(close) OVER (ORDER BY trade_date ROWS 19 PRECEDING) AS ma20,
+            MAX(high) OVER (ORDER BY trade_date ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING) AS pivot_price
         FROM stock_price 
         WHERE stock_code = '{stock_code}' 
         ORDER BY trade_date DESC 
-        LIMIT 20
+        LIMIT 30  -- 多取几条确保窗口计算完整
     """
     try:
-        df = con.execute(sql).df().sort_values('trade_date')
+        df = con.execute(sql).df().sort_values('trade_date')  # 按时间升序方便计算 ATR
         con.close()
-        if len(df) < 15:
-            return None
+        if len(df) < 20:
+            print(f"⚠️ {stock_code} 数据不足20条，无法计算波动区间")
+            return {}
     except Exception as e:
         print(f"提取 {stock_code} 波动数据失败: {e}")
-        return None
+        con.close()
+        return {}
 
     # --- A. 计算 15日 ATR (真实波幅) ---
     high_low = df['high'] - df['low']
@@ -734,39 +828,36 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
     tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
     atr_15 = tr.tail(15).mean()
 
-    # --- B. 计算 VIX 调节因子 (关键优化) ---
-    # 理论依据：VIX 越高，市场非理性波动越大，需要更宽的止损垫
-    # 基准 VIX 设为 18，每高出 1 点，波动空间放大 5%
+    # --- B. 计算 VIX 调节因子 ---
     vix_factor = 1.0
     if current_vix > 18:
         vix_factor = 1 + (current_vix - 18) * 0.05
-        vix_factor = min(vix_factor, 1.8)  # 最高限制在 1.8 倍，防止止损过深
+        vix_factor = min(vix_factor, 1.8)  # 最高不超过 1.8 倍
 
     current_price = df['close'].iloc[-1]
-    
+    pivot_price = df['pivot_price'].iloc[-1]
+    ma20 = df['ma20'].iloc[-1]
+
     # --- C. 计算动态水位 ---
-    # 理想入场位：价格回调 0.6 倍 ATR (经 VIX 修正)
     pullback_dist = atr_15 * 0.6 * vix_factor
     entry_low = current_price - pullback_dist
-    entry_high = current_price * 0.99  # 至少等待 1% 的回调以避免追涨
+    entry_high = current_price * 0.99
 
-    # 硬止损位：1.5 倍 ATR (经 VIX 修正)，防扫单
-    stop_dist = atr_15 * 1.5 * vix_factor
-    hard_stop = current_price - stop_dist
+    hard_stop = current_price - atr_15 * 1.5 * vix_factor
+
+    # 失败模式止损：取 pivot-7%、ma20、hard_stop 中的最小值
+    stop_pivot = pivot_price * 0.93 if pivot_price > 0 else float('inf')
+    stop_ma20 = ma20 if ma20 > 0 else float('inf')
+    failure_stop = min(stop_pivot, stop_ma20, hard_stop)
 
     return {
         'ideal_entry': f"{entry_low:.2f} - {entry_high:.2f}",
         'hard_stop': round(hard_stop, 2),
+        'failure_stop': round(failure_stop, 2),
         'atr_15': round(atr_15, 2),
         'vix_adj': round(vix_factor, 2)
     }
 
-
-# 3-40 天周期的操作建议在 SwingTrend 系统中，这个周期的操作核心是**“止损上移”**：
-# 时间点动作第 1 天突破 Pivot Point 买入，止损设在 -5%。
-# 第 5-10 天如果利润达到 5-8%，将止损移至成本价（确保不亏）。
-# 第 10-40 天观察 10日均线 (MA10)。只要收盘价不破 MA10，就一直持有。
-# 卖出信号跌破关键均线或 RS Rank 掉出前 70 名。
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
@@ -787,13 +878,63 @@ def main():
 
     # 3️⃣ State 1: C, 每天只需更新最新的股票价格数据即可
     print(f"🚀 Stage 1: 更新最新的股票价格数据")
-    update_recent_prices(CURRENT_SELECTED_TICKERS)
+    # 新增：确保SPY和QQQ数据更新，用于Market Regime Filter
+    update_recent_prices(CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"])
 
     # 🚀 修复点：自动获取库中最新的交易日期
     latest_date_in_db = get_latest_date_in_db()
     if not latest_date_in_db:
         print("❌ 数据库中没有价格数据，请先运行 fetch_all_prices()")
         return
+
+    # 新增：建议3 - Market Regime Filter
+    # SPY > MA200 AND QQQ > MA50，否则不交易
+    print("🔍 检查市场 Regime...")
+    con = duckdb.connect(DUCKDB_PATH)
+    spy_sql = f"""
+        SELECT close, ma200, ma50
+        FROM (
+            SELECT 
+                close,
+                AVG(close) OVER (ORDER BY trade_date ROWS 199 PRECEDING) AS ma200,
+                AVG(close) OVER (ORDER BY trade_date ROWS 49 PRECEDING) AS ma50
+            FROM stock_price
+            WHERE stock_code = 'SPY'
+            ORDER BY trade_date DESC
+            LIMIT 1
+        )
+    """
+    spy_df = con.execute(spy_sql).df()
+    qqq_sql = f"""
+        SELECT close, ma200, ma50
+        FROM (
+            SELECT 
+                close,
+                AVG(close) OVER (ORDER BY trade_date ROWS 199 PRECEDING) AS ma200,
+                AVG(close) OVER (ORDER BY trade_date ROWS 49 PRECEDING) AS ma50
+            FROM stock_price
+            WHERE stock_code = 'QQQ'
+            ORDER BY trade_date DESC
+            LIMIT 1
+        )
+    """
+    qqq_df = con.execute(qqq_sql).df()
+    con.close()
+
+    if spy_df.empty or qqq_df.empty:
+        print("❌ SPY或QQQ数据缺失，无法检查 Regime。")
+        return
+
+    spy_close = spy_df['close'].iloc[0]
+    spy_ma200 = spy_df['ma200'].iloc[0]
+    qqq_close = qqq_df['close'].iloc[0]
+    qqq_ma50 = qqq_df['ma50'].iloc[0]
+
+    if not (spy_close > spy_ma200 and qqq_close > qqq_ma50):
+        print("⚠️ 市场 Regime 不满足 (SPY < MA200 或 QQQ < MA50)，今日不交易。")
+        return
+
+    print("✅ 市场 Regime 满足，继续筛选。")
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
@@ -853,6 +994,9 @@ def main():
     pullback_df = pd.DataFrame(pullback_list)
     final_with_sim = pd.concat([final_filtered.reset_index(drop=True), pullback_df], axis=1)
 
+    # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
+    final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
+
     # 确保日期格式美化（可选，防止 Excel 里显示长字符串）
     if 'trade_date' in final_with_sim.columns:
         final_with_sim['trade_date'] = pd.to_datetime(final_with_sim['trade_date']).dt.strftime('%Y-%m-%d')
@@ -864,21 +1008,25 @@ def main():
     print("-" * 150)
     display_cols = [
         "is_current_hold", "stock_code", "close", 
-        "ideal_entry", "hard_stop", "vix_adj", "rs_rank", "canslim_score"
+        "ideal_entry", "hard_stop", "failure_stop", "rs_rank",
+        "hard_stop", "target_profit", "canslim_score",
+        "quarterly_eps_growth", "annual_eps_growth",
+        "revenue_growth", "roe", "shares_outstanding", 
+        "inst_ownership", "fcf_quality", "market_cap"
     ]
     print(final_with_sim[display_cols].to_string(index=False))
 
     # 保存结果
     if not final_with_sim.empty:
-        file_name_xlsx = f"swing_strategy_vix_sim_v2_{datetime.now():%Y%m%d}.xlsx"
+        file_name_xlsx = f"swing_strategy_vix_sim_{datetime.now():%Y%m%d}.xlsx"
         try:
-            final_with_sim.to_excel(file_name_xlsx, index=False, engine='openpyxl')
+            final_with_sim[display_cols].to_excel(file_name_xlsx, index=False, engine='openpyxl')
             print(f"\n📊 详细策略报告已生成 Excel: {file_name_xlsx}")
         except Exception as e:
             print(f"❌ Excel 生成失败 (请检查是否安装 openpyxl): {e}")
             # 备选保存为 CSV
             file_name_csv = file_name_xlsx.replace(".xlsx", ".csv")
-            final_with_sim.to_csv(file_name_csv, index=False, encoding="utf-8-sig")
+            final_with_sim[display_cols].to_csv(file_name_csv, index=False, encoding="utf-8-sig")
             print(f"\n📊 详细策略报告已生成: {file_name_csv}")
     else:
         print("⚠️ 经过基本面严格筛选后，没有符合条件的股票。")

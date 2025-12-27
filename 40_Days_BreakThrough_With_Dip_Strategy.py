@@ -414,6 +414,14 @@ def update_fundamentals(ticker_list, force_update=False):
 
     for symbol in need_update:
         try:
+            fundamentals_sql = f"""
+                SELECT stock_code FROM stock_fundamentals WHERE update_date >= CURRENT_DATE AND stock_code = '{symbol}'
+            """
+            fundamentals_sql_df = con.execute(fundamentals_sql).df()
+            if not fundamentals_sql_df.empty:
+                print(f"  [跳过] {symbol} 基本面数据在有效期内")
+                continue
+            
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
 
@@ -443,10 +451,9 @@ def update_fundamentals(ticker_list, force_update=False):
             # 使用 UPSERT 逻辑
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                symbol, datetime.now().date(), quarterly_eps_growth, annual_eps_growth, 
-                rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
+                symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
             ))
 
             print(f"  [OK] {symbol} (CAN SLIM Score: {score})")
@@ -528,62 +535,110 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
 
 def filter_dip_stocks_from_db(target_date_str: str):
     """
-    实现突破回踩策略：
-    A. 寻找前40日最高收盘价作为支撑位
-    B. 验证当日回踩条件（条件1, 2, 3）
-    美股中小盘金律：
-    ① 股价 > $5
-    ② 日成交额 > $200万 (50日均值)
+    实现严格突破回踩策略：
+    1. A为支撑日，B为突破日（A在B前40天内）。
+    2. A与B之间所有收盘价 < A的收盘价。
+    3. 当前日(C/D/E)在B之后，且满足回踩支撑位A的条件。
     """
     con = duckdb.connect(DUCKDB_PATH)
     
-    # 定义回踩参数
-    VOLATILITY_LIMIT = 0.05         # 条件3：波动性限制
-    SUPPORT_TOLERANCE = 0.995       # 条件1：最低价容差因子
-    MIN_PRICE = 5.0                 # 金律①：股价门槛
-    MIN_DOLLAR_VOLUME = 2000000     # 金律②：成交额门槛 (200万美元)
+    # 参数定义
+    VOLATILITY_LIMIT = 0.05         # 条件2.3：波动性限制
+    SUPPORT_TOLERANCE = 0.995       # 条件2.1：最低价容差因子
+    MIN_PRICE = 5.0                 # 金律①
+    MIN_DOLLAR_VOLUME = 2000000     # 金律②
     
     sql = f"""
-    WITH DailyData AS (
-        SELECT 
-            stock_code, trade_date, close, high, low, volume,
-            -- 计算50日平均成交额 (Close * Volume)
-            AVG(close * volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 50 PRECEDING) as avg_dollar_volume,
-            (high - low) / NULLIF(LAG(close) OVER (PARTITION BY stock_code ORDER BY trade_date), 0) as amplitude
+    WITH Ordered AS (
+        SELECT
+            stock_code,
+            trade_date,
+            open, high, low, close, volume,
+            ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date) AS rn
         FROM stock_price
-        WHERE trade_date <= '{target_date_str}'
     ),
-    SupportLevel AS (
-        SELECT *,
-            -- A. 找出交易当天之前40个交易日的最高收盘价 (不含当天)
-            MAX(close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING) as support_price,
-            -- B. 找出最高收盘价对应的日期 (使用 DuckDB 的 arg_max 函数)
-            arg_max(trade_date, close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING) as support_date
-        FROM DailyData
+
+    A_Candidate AS (
+        SELECT
+            o1.stock_code,
+            o1.trade_date AS support_date,
+            o1.close AS support_price,
+            o1.rn AS a_rn
+        FROM Ordered o1
+        WHERE NOT EXISTS (
+            SELECT 1 FROM Ordered o2
+            WHERE o2.stock_code = o1.stock_code
+            AND o2.rn BETWEEN o1.rn + 1 AND o1.rn + 40
+            AND o2.close >= o1.close
+        )
     ),
-    Filtered AS (
-        SELECT *
-        FROM SupportLevel
-        WHERE trade_date = '{target_date_str}'
-          -- 金律检查 ① 股价门槛
-          AND close >= {MIN_PRICE}
-          -- 金律检查 ② 成交额门槛
-          AND avg_dollar_volume >= {MIN_DOLLAR_VOLUME}
-          -- 条件1：最高价和最低价*99.5%包含支持价
-          AND high >= support_price 
-          AND (low * {SUPPORT_TOLERANCE}) <= support_price
-          -- 条件2：收盘价高于支持价
-          AND close > support_price
-          -- 条件3：波动性小于 LIMIT
-          /* AND amplitude <= {VOLATILITY_LIMIT} */
+
+    B_Day AS (
+        SELECT
+            a.stock_code,
+            a.support_date,
+            a.support_price,
+            o.trade_date AS breakthrough_date,
+            o.close AS breakthrough_price
+        FROM A_Candidate a
+        JOIN Ordered o
+        ON o.stock_code = a.stock_code
+        AND o.rn = a.a_rn + 41
+        AND o.close > a.support_price
+    ),
+
+    C_Dip AS (
+        SELECT
+            b.stock_code,
+            b.support_date,
+            b.support_price,
+            b.breakthrough_date,
+            b.breakthrough_price,
+            o.trade_date AS dip_date,
+            o.close AS dip_price,
+            o.high,
+            o.low,
+            o.volume,
+            (o.high - o.low) / NULLIF(LAG(o.close) OVER (PARTITION BY o.stock_code ORDER BY o.trade_date), 0) AS volatility,
+            AVG(o.close * o.volume) OVER (
+                PARTITION BY o.stock_code
+                ORDER BY o.trade_date
+                ROWS 50 PRECEDING
+            ) AS avg_dollar_volume
+        FROM B_Day b
+        JOIN Ordered o
+        ON o.stock_code = b.stock_code
+        AND o.trade_date > b.breakthrough_date
     )
-    -- 返回包含回踩日期(trade_date)和支撑位日期(support_date)
-    SELECT stock_code, trade_date, support_date, close, support_price, amplitude 
-    FROM Filtered
+
+    SELECT
+        stock_code,
+        support_date,
+        support_price,
+        breakthrough_date,
+        breakthrough_price,
+        dip_date,
+        dip_price,
+        high,
+        low,
+        volatility,
+        avg_dollar_volume
+    FROM C_Dip
+    WHERE
+        high >= support_price
+        AND low * 0.995 <= support_price
+        AND dip_price > support_price
+        /* AND volatility < {VOLATILITY_LIMIT} */
+        AND dip_price >= {MIN_PRICE}
+        AND avg_dollar_volume IS NOT NULL
+        AND avg_dollar_volume >= {MIN_DOLLAR_VOLUME}
+        AND dip_date = '{target_date_str}'
     """
+    
     result_df = con.execute(sql).df()
     con.close()
     return result_df
+
 
 # ==================== 计算全市场 RS Rank ====================
 def calculate_rs_rank_for_candidates(candidates_df, target_date_str):
@@ -637,7 +692,7 @@ def link_fundamental_data(candidates_df):
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE", "MLI", "NVO"]
+CURRENT_SELECTED_TICKERS = ["CDE"]
 # CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
@@ -702,12 +757,9 @@ def main():
     pullback_df = pd.DataFrame(pullback_list)
     final_with_sim = pd.concat([final_df.reset_index(drop=True), pullback_df], axis=1)
 
-    # 1. 定义需要保留2位小数的浮点数列名（根据实际列名调整）
-    float_cols = [
-        'close', 'support_price', 'quarterly_eps_growth', 'annual_eps_growth', 
-        'revenue_growth', 'roe', 'inst_ownership', 'fcf_quality'
-    ]
-    
+    # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
+    final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
+
     # 2. 统一保留两位小数
     # 自动识别 DataFrame 中存在的浮点数列并取2位小数
     final_with_sim = final_with_sim.round(2)
@@ -733,9 +785,16 @@ def main():
 
     # 9️⃣ 打印输出
     display_cols = [
-        "stock_code", "trade_date", "support_date","close", "support_price", "rs_rank", 
-        "canslim_score", "quarterly_eps_growth", "annual_eps_growth", "revenue_growth", 
-        "roe", "shares_outstanding", "inst_ownership", "fcf_quality", "ideal_entry"
+        "stock_code",
+        "support_date", "support_price",
+        "breakthrough_date", "breakthrough_price",
+        "dip_date", "dip_price",
+        "rs_rank",
+        "hard_stop", "target_profit", "ideal_entry",
+        "canslim_score",
+        "quarterly_eps_growth", "annual_eps_growth",
+        "revenue_growth", "roe",
+        "shares_outstanding", "inst_ownership", "fcf_quality"
     ]
     
     # 过滤掉不存在的列以防报错
