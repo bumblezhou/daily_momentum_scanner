@@ -11,6 +11,7 @@ requests==2.32.3
 
 # 辅助工具
 urllib3==1.26.20
+openpyxl==3.1.5
 
 # Excel 导出支持 (用于处理特殊符号和 .xlsx 格式)
 openpyxl==3.1.5

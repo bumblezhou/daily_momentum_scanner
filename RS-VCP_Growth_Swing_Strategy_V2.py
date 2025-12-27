@@ -861,7 +861,7 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE", "MLI", "NVO"]
+CURRENT_SELECTED_TICKERS = ["CDE"]
 # CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
