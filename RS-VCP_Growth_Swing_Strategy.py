@@ -41,6 +41,8 @@ def init_db():
             mic TEXT,
             currency TEXT,
             type TEXT,
+            sector TEXT,
+            industry TEXT,
             updated_at TIMESTAMP
         )
     """)
@@ -657,6 +659,15 @@ def update_fundamentals(con, ticker_list, force_update=False):
 
             # --- 金律字段提取 ---
             market_cap = info.get('marketCap', 0) or 0
+
+            # 更新 sector 和 industry
+            sector = info.get("sector")
+            industry = info.get("industry")
+            con.execute("""
+                UPDATE stock_ticker
+                SET sector = ?, industry = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE symbol = ?
+            """, (sector, industry, symbol))
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
