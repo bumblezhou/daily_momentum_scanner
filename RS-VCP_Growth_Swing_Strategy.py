@@ -181,7 +181,6 @@ def fetch_all_prices():
         WHERE type = 'Common Stock' AND mic IN (
             'XNYS',
             'XNGS',
-            'XNAS',
             'XASE',
             'ARCX',
             'BATS',
@@ -228,24 +227,33 @@ def get_recent_trading_days_smart(n=10):
 
 
 # 找出「最近交易日有缺失行情」的 ticker
-def get_tickers_missing_recent_data(target_date):
+def get_tickers_missing_recent_data(trading_days):
     """
     返回尚未更新到最近一个交易日的 ticker 列表
     """
+    latest_trading_day = trading_days[-1]
+
     con = duckdb.connect(DUCKDB_PATH)
 
     query = f"""
         SELECT t.symbol
         FROM stock_ticker t
         LEFT JOIN (
-            SELECT stock_code, MAX(trade_date) AS last_date
+            SELECT
+                stock_code,
+                MAX(trade_date) AS last_trade_date
             FROM stock_price
             GROUP BY stock_code
-        ) p ON p.stock_code = t.symbol
-        WHERE t.type = 'Common Stock'
-          AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
-          AND COALESCE(t.yf_price_available, TRUE) = TRUE
-          AND (p.last_date IS NULL OR p.last_date < CAST('{target_date}' AS DATE))
+        ) p
+        ON p.stock_code = t.symbol
+        WHERE
+            t.type = 'Common Stock'
+            AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+            AND COALESCE(t.yf_price_available, TRUE) = TRUE
+            AND (
+                p.last_trade_date IS NULL
+                OR p.last_trade_date < DATE '{latest_trading_day}'
+            )
     """
 
     tickers = [r[0] for r in con.execute(query).fetchall()]
@@ -299,7 +307,7 @@ def update_recent_prices(watchlist: list = []):
     print(f"🎯 目标同步日期: {target_date}")
 
     # 2. 检查数据库缺失
-    raw_tickers = get_tickers_missing_recent_data(target_date)
+    raw_tickers = get_tickers_missing_recent_data(trading_days)
     if watchlist:
         # 合并自选列表
         raw_tickers = list(set(raw_tickers) | set(watchlist))
@@ -311,7 +319,7 @@ def update_recent_prices(watchlist: list = []):
     yahoo_map = {t: finnhub_to_yahoo(t) for t in raw_tickers}
     yahoo_tickers = list(yahoo_map.values())
 
-    print(f"需要更新 {len(yahoo_tickers)} 只股票: {yahoo_tickers}")
+    print(f"需要更新 {len(yahoo_tickers)} 只股票")
 
     for i in range(0, len(yahoo_tickers), YF_BATCH_SIZE):
         batch = yahoo_tickers[i:i + YF_BATCH_SIZE]
@@ -366,6 +374,231 @@ def update_recent_prices(watchlist: list = []):
     print("🎉 全部完成")
 
 
+# ============================================================
+# Stage 2：SwingTrend 技术筛选（全部在 DuckDB 内完成）
+# ============================================================
+
+def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.DataFrame:
+    con = duckdb.connect(DUCKDB_PATH)
+
+    # 将列表转换为 SQL 字符串格式 ('AAPL', 'TSLA')
+    monitor_str = ", ".join([f"'{t}'" for t in monitor_list]) if monitor_list else "''"
+
+    sql = f"""
+    /* ======================================================
+       Stage 2 – SwingTrend 技术筛选
+       所有参数均可根据注释位置自行调整
+       ====================================================== */
+
+    WITH base AS (
+        SELECT
+            stock_code,
+            trade_date,
+            close,
+            high,
+            low,
+            volume,
+
+            /* ===== 均线参数（可调） ===== */
+            AVG(close) OVER w10  AS ma10,    -- 短线持仓用
+            AVG(close) OVER w50  AS ma50,
+            AVG(close) OVER w150 AS ma150,
+            AVG(close) OVER w200 AS ma200,
+
+            /* ===== 52 周高低点窗口（252 日） ===== */
+            MAX(high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
+            MIN(low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
+
+            COUNT(*) OVER w_all AS trading_days
+        FROM stock_price
+        WINDOW
+            w10  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING),
+            w50  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 49 PRECEDING),
+            w150 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 149 PRECEDING),
+            w200 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 199 PRECEDING),
+            w252 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 251 PRECEDING),
+            w_all AS (PARTITION BY stock_code)
+    ),
+
+    /* ===== RS Rank 计算（Minervini 权重） ===== */
+    returns AS (
+        SELECT
+            stock_code,
+            trade_date,
+
+            /* 对上市不足一年的股票，自动使用可得周期并年化 */
+            POWER(
+                close / NULLIF(
+                    LAG(close, LEAST(trading_days - 1, 252))
+                    OVER (PARTITION BY stock_code ORDER BY trade_date),
+                0),
+                252.0 / NULLIF(LEAST(trading_days - 1, 252), 0)
+            ) - 1 AS r1y,
+
+            close / NULLIF(LAG(close,126) OVER w, close) - 1 AS r6m,
+            close / NULLIF(LAG(close,63)  OVER w, close) - 1 AS r3m,
+            close / NULLIF(LAG(close,21)  OVER w, close) - 1 AS r1m
+        FROM base
+        WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
+    ),
+
+    rs_ranked AS (
+        SELECT
+            stock_code,
+            trade_date,
+
+            /* RS 权重（可调） */
+            0.4*r1y + 0.3*r6m + 0.2*r3m + 0.1*r1m AS rs_score,
+
+            /* 全市场百分位排名 */
+            PERCENT_RANK() OVER (
+                PARTITION BY trade_date
+                ORDER BY 0.4*r1y + 0.3*r6m + 0.2*r3m + 0.1*r1m
+            ) * 100 AS rs_rank
+        FROM returns
+    ),
+
+    /* ===== ATR（VCP 波动收缩） ===== */
+    atr_raw AS (
+        SELECT
+            stock_code,
+            trade_date,
+            GREATEST(
+                high - low,
+                ABS(high - LAG(close) OVER w),
+                ABS(low  - LAG(close) OVER w)
+            ) AS tr
+        FROM stock_price
+        WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
+    ),
+
+    atr_stats AS (
+        SELECT
+            stock_code,
+            trade_date,
+            AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING)  AS atr10,
+            AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 49 PRECEDING) AS atr50
+        FROM atr_raw
+    ),
+
+    /* ===== Pivot（最近 40 日高点） ===== */
+    /* 修正点：重命名 CTE 为 pivot_data 避免关键字冲突 */
+    pivot_data AS (
+        SELECT
+            stock_code,
+            trade_date,
+            /* 修正点：取昨日起算的过去20日最高价，作为今天的压力位 */
+            MAX(high) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING
+            ) AS pivot_price
+        FROM stock_price
+    ),
+
+    /* ===== 成交量确认 ===== */
+    volume_check AS (
+        SELECT
+            stock_code,
+            trade_date,
+            volume,
+            AVG(volume) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS 49 PRECEDING
+            ) AS vol50
+        FROM stock_price
+    )
+
+    SELECT
+        b.stock_code,
+        b.trade_date,
+        b.close,
+        r.rs_rank,
+        b.ma10, b.ma50, b.ma150, b.ma200,
+        b.high_52w, b.low_52w,
+        a.atr10, a.atr50,
+        p.pivot_price,
+        v.volume, v.vol50
+
+    FROM base b
+    JOIN rs_ranked r USING (stock_code, trade_date)
+    JOIN atr_stats a USING (stock_code, trade_date)
+    JOIN pivot_data p USING (stock_code, trade_date)
+    JOIN volume_check v USING (stock_code, trade_date)
+
+    WHERE
+        b.trade_date = DATE '{target_date}'
+        AND (
+            (
+                /* ===== Trend Template（可调阈值） ===== */
+                b.close > b.ma150
+                AND b.ma150 > b.ma200
+                AND b.ma50  > b.ma150
+                AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
+                AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
+
+                /* ===== RS Rank 门槛 ===== */
+                AND r.rs_rank >= 70
+
+                /* ===== VCP：波动正在收缩 ===== */
+                AND a.atr10 < a.atr50
+
+                /* ===== Pivot 放量突破 ===== */
+                AND b.close > p.pivot_price * 0.99
+                AND v.volume >= 1.2 * v.vol50     -- 放量倍数（可调）
+            )
+            OR
+            -- 新增：如果是自选股，强制通过筛选
+            b.stock_code IN ({monitor_str})
+        )
+
+    """
+
+    df = con.execute(sql).df()
+    con.close()
+    return df
+
+
+def build_stage3_fundamental_fast(stage2_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    从本地 DuckDB 直接获取基本面评分 (极速版)
+    """
+    if stage2_df.empty:
+        return pd.DataFrame()
+    
+    con = duckdb.connect(DUCKDB_PATH)
+
+    # 将 Stage 2 的结果注册为临时表，方便与基本面表 JOIN
+    con.register("tmp_stage2", stage2_df)
+    
+    ticker_list = stage2_df["stock_code"].unique().tolist()
+    update_fundamentals(con, ticker_list, force_update=True)
+
+    # 💡 核心修正：只选择基本面相关的列 + 关联主键
+    sql = """
+        SELECT 
+            f.stock_code,
+            f.canslim_score,
+            f.quarterly_eps_growth,
+            f.annual_eps_growth,
+            f.roe,
+            f.revenue_growth,
+            f.fcf_quality,
+            f.shares_outstanding,
+            f.inst_ownership,
+            f.market_cap
+        FROM stock_fundamentals f
+        WHERE f.stock_code IN (SELECT stock_code FROM tmp_stage2) AND f.fcf_quality IS NOT NULL AND f.roe IS NOT NULL
+    """
+    
+    result_df = con.execute(sql).df()
+
+    con.close()
+
+    return result_df
+
+
 # 创建基本面数据表结构
 def init_fundamental_table(con):
     """初始化基本面数据表"""
@@ -387,13 +620,11 @@ def init_fundamental_table(con):
 
 
 # 编写“增量更新”脚本（扩展为 CAN SLIM）
-def update_fundamentals(ticker_list, force_update=False):
+def update_fundamentals(con, ticker_list, force_update=False):
     """
     定期更新基本面数据，包括 CAN SLIM 特定指标
     force_update: 是否强制更新所有股票，否则只更新过期数据
     """
-
-    con = duckdb.connect(DUCKDB_PATH)
 
     init_fundamental_table(con)
 
@@ -413,7 +644,6 @@ def update_fundamentals(ticker_list, force_update=False):
         return
 
     print(f"🚀 开始更新 {len(need_update)} 只股票的基本面...")
-
     for symbol in need_update:
         try:
             fundamentals_sql = f"""
@@ -423,7 +653,7 @@ def update_fundamentals(ticker_list, force_update=False):
             if not fundamentals_sql_df.empty:
                 print(f"  [跳过] {symbol} 基本面数据在有效期内")
                 continue
-            
+
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
 
@@ -473,8 +703,7 @@ def update_fundamentals(ticker_list, force_update=False):
         except Exception as e:
             print(f"  [ERR] {symbol} 更新失败: {e}")
             continue
-    
-    con.close()
+
 
 def get_latest_date_in_db():
     con = duckdb.connect(DUCKDB_PATH)
@@ -544,170 +773,19 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
     }
 
 
-def filter_dip_stocks_from_db(target_date_str: str):
-    """
-    实现严格突破回踩策略：
-    1. A为支撑日，B为突破日（A在B前40天内）。
-    2. A与B之间所有收盘价 < A的收盘价。
-    3. 当前日(C/D/E)在B之后，且满足回踩支撑位A的条件。
-    """
-    con = duckdb.connect(DUCKDB_PATH)
-    
-    # 参数定义
-    VOLATILITY_LIMIT = 0.05         # 条件2.3：波动性限制
-    SUPPORT_TOLERANCE = 0.995       # 条件2.1：最低价容差因子
-    MIN_PRICE = 5.0                 # 金律①
-    MIN_DOLLAR_VOLUME = 2000000     # 金律②
-    
-    sql = f"""
-    WITH Ordered AS (
-        SELECT
-            stock_code,
-            trade_date,
-            open, high, low, close, volume,
-            ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date) AS rn
-        FROM stock_price
-    ),
-
-    A_Candidate AS (
-        SELECT
-            o1.stock_code,
-            o1.trade_date AS support_date,
-            o1.close AS support_price,
-            o1.rn AS a_rn
-        FROM Ordered o1
-        WHERE NOT EXISTS (
-            SELECT 1 FROM Ordered o2
-            WHERE o2.stock_code = o1.stock_code
-            AND o2.rn BETWEEN o1.rn + 1 AND o1.rn + 40
-            AND o2.close >= o1.close
-        )
-    ),
-
-    B_Day AS (
-        SELECT
-            a.stock_code,
-            a.support_date,
-            a.support_price,
-            o.trade_date AS breakthrough_date,
-            o.close AS breakthrough_price
-        FROM A_Candidate a
-        JOIN Ordered o
-        ON o.stock_code = a.stock_code
-        AND o.rn = a.a_rn + 41
-        AND o.close > a.support_price
-    ),
-
-    C_Dip AS (
-        SELECT
-            b.stock_code,
-            b.support_date,
-            b.support_price,
-            b.breakthrough_date,
-            b.breakthrough_price,
-            o.trade_date AS dip_date,
-            o.close AS dip_price,
-            o.high,
-            o.low,
-            o.volume,
-            (o.high - o.low) / NULLIF(LAG(o.close) OVER (PARTITION BY o.stock_code ORDER BY o.trade_date), 0) AS volatility,
-            AVG(o.close * o.volume) OVER (
-                PARTITION BY o.stock_code
-                ORDER BY o.trade_date
-                ROWS 50 PRECEDING
-            ) AS avg_dollar_volume
-        FROM B_Day b
-        JOIN Ordered o
-        ON o.stock_code = b.stock_code
-        AND o.trade_date > b.breakthrough_date
-    )
-
-    SELECT
-        stock_code,
-        support_date,
-        support_price,
-        breakthrough_date,
-        breakthrough_price,
-        dip_date,
-        dip_price,
-        high,
-        low,
-        volume,
-        volatility,
-        avg_dollar_volume
-    FROM C_Dip
-    WHERE
-        high >= support_price
-        AND low * 0.995 <= support_price
-        AND dip_price > support_price
-        /* AND volatility < {VOLATILITY_LIMIT} */
-        AND dip_price >= {MIN_PRICE}
-        AND avg_dollar_volume IS NOT NULL
-        AND avg_dollar_volume >= {MIN_DOLLAR_VOLUME}
-        AND dip_date = '{target_date_str}'
-    """
-    
-    result_df = con.execute(sql).df()
-    con.close()
-    return result_df
-
-
-# ==================== 计算全市场 RS Rank ====================
-def calculate_rs_rank_for_candidates(candidates_df, target_date_str):
-    """基于全市场表现计算 RS Rank"""
-    if candidates_df.empty: return candidates_df
-    con = duckdb.connect(DUCKDB_PATH)
-    sql = f"""
-    WITH Performance AS (
-        SELECT stock_code,
-               (MAX(close) - MIN(close)) / NULLIF(MIN(close), 0) as yearly_return
-        FROM stock_price
-        WHERE trade_date >= CAST('{target_date_str}' AS DATE) - INTERVAL '1 year'
-        GROUP BY stock_code
-    )
-    SELECT stock_code, ROUND(PERCENT_RANK() OVER (ORDER BY yearly_return) * 100, 1) as rs_rank
-    FROM Performance
-    """
-    rs_df = con.execute(sql).df()
-    con.close()
-    return pd.merge(candidates_df, rs_df, on='stock_code', how='left')
-
-# ==================== 给候选股票数据关联上基本面数据 ====================
-def link_fundamental_data(candidates_df):
-    """给候选股票数据关联上基本面数据"""
-    # 关联基本面数据并应用 金律③ 和 市值区间
-    MIN_MARKET_CAP = 300_000_000    # 3亿美元
-    MAX_MARKET_CAP = 5_000_000_000  # 建议放宽到50亿美元以覆盖更多类似A股的高质股
-    MIN_INST_OWN = 0.3             # 金律③：机构持仓 > 30%
-    con = duckdb.connect(DUCKDB_PATH)
-    found_sql = f"""
-        SELECT
-            stock_code,
-            quarterly_eps_growth,
-            annual_eps_growth,
-            revenue_growth,
-            roe,
-            shares_outstanding,
-            inst_ownership,
-            fcf_quality,
-            canslim_score,
-            market_cap
-        FROM stock_fundamentals
-        WHERE market_cap BETWEEN {MIN_MARKET_CAP} AND {MAX_MARKET_CAP}
-          AND inst_ownership >= {MIN_INST_OWN}
-    """
-    fundamentals_df = con.execute(found_sql).df()
-    final_df = pd.merge(candidates_df, fundamentals_df, on='stock_code', how='left')
-    con.close()
-    return final_df
-
+# 3-40 天周期的操作建议在 SwingTrend 系统中，这个周期的操作核心是**“止损上移”**：
+# 时间点动作第 1 天突破 Pivot Point 买入，止损设在 -5%。
+# 第 5-10 天如果利润达到 5-8%，将止损移至成本价（确保不亏）。
+# 第 10-40 天观察 10日均线 (MA10)。只要收盘价不破 MA10，就一直持有。
+# 卖出信号跌破关键均线或 RS Rank 掉出前 70 名。
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE"]
+CURRENT_SELECTED_TICKERS = ["CDE", "MLI", "NVO"]
 # CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
+# ===================== 主流程 =====================
 def main():
     # 1️⃣ State 1: A, Finnhub ticker
     # 首次执行时解开注释执行，以后每天轮动不用再执行
@@ -721,32 +799,49 @@ def main():
     # 3️⃣ State 1: C, 每天只需更新最新的股票价格数据即可
     print(f"🚀 Stage 1: 更新最新的股票价格数据")
     update_recent_prices(CURRENT_SELECTED_TICKERS)
-    
-    latest_date_in_db = get_latest_date_in_db()
-    target_date_str = latest_date_in_db.strftime('%Y-%m-%d')
 
-    # 4️⃣ 技术面初步筛选
-    print(f"🚀 Step 1: 正在筛选 {target_date_str} 符合突破回踩形态的股票...")
-    stage2_df = filter_dip_stocks_from_db(target_date_str)
-    
-    if stage2_df.empty:
-        print("❌ 未发现符合条件的股票。")
+    # 🚀 修复点：自动获取库中最新的交易日期
+    latest_date_in_db = get_latest_date_in_db()
+    if not latest_date_in_db:
+        print("❌ 数据库中没有价格数据，请先运行 fetch_all_prices()")
         return
 
-    # 5️⃣ 针对候选股更新基本面 (仅更新这几只，速度极快)
-    print(f"🚀 Step 2: 更新 {len(stage2_df)} 只候选股的基本面及子项...")
-    update_fundamentals(stage2_df['stock_code'].tolist(), force_update=False)
-    
-    # 6️⃣ 计算 RS Rank 
-    print("🚀 Step 3: 计算全市场 RS Rank...")
-    # 计算 RS Rank
-    candidates_df = calculate_rs_rank_for_candidates(stage2_df, target_date_str)
-    
-    # 7️⃣ 关联基本面分数
-    print("🚀 Step 4: 关联基本面分数...")
-    final_df = link_fundamental_data(candidates_df)
+    # 4️⃣ Stage 2: SwingTrend 技术筛选
+    print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
+    stage2 = build_stage2_swingtrend(latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS)
+    print(f"Stage 2 股票数量: {len(stage2)}")
 
-    # 8️⃣ 波动模拟 (VIX 调节)
+    if stage2.empty:
+        print("❌ 今日无符合技术面筛选的股票，程序结束。")
+        return # 或者保存一个空结果
+
+    # 5️⃣ Stage 3: 基本面分析
+    print("📊 Stage 3: 基本面分析")
+    stage3 = build_stage3_fundamental_fast(stage2)
+    # stage3 = build_stage3_fundamental(stage2)
+
+    # 合并结果
+    final = stage2.merge(stage3, on="stock_code", how="left")
+    # 填充缺失的基本面分数为 0，防止 query 报错
+    final["canslim_score"] = final["canslim_score"].fillna(0)
+
+    # 标记来源（可选：方便你在结果中区分哪些是买入的，哪些是新选出的）
+    final["is_current_hold"] = final["stock_code"].apply(lambda x: "✅" if x in CURRENT_SELECTED_TICKERS else "❌")
+
+    # 过滤与排序
+    # 💡 注意：如果你放宽了条件，这里的 canslim_score >= 3 可能又会把结果过滤成 0
+    # 建议先打印看看
+    print(f"合并后带评分的股票总数: {len(final)}")
+    
+    # 暂时降低过滤门槛以确保有输出
+    final_filtered = (
+        final
+        .query("canslim_score >= 0") # 先改成 0 跑通流程
+        .sort_values(["canslim_score", "rs_rank", "is_current_hold"], ascending=False)
+        .head(20)
+    )
+
+    # 6️⃣ 波动模拟 (VIX 调节)
     print("\n🔍 正在获取市场 VIX 数据以调节波动区间...")
     try:
         vix_df = yf.download("^VIX", period="1d", progress=False, proxy=PROXIES["http"])
@@ -761,63 +856,34 @@ def main():
     # 注入回撤模拟数据
     print("🛠️ 正在计算个股波动容错区间...")
     pullback_list = []
-    for ticker in final_df['stock_code']:
+    for ticker in final_filtered['stock_code']:
         p_data = simulate_pullback_range(ticker, current_vix=current_vix)
         pullback_list.append(p_data if p_data else {})
     
     # 合并模拟结果
     pullback_df = pd.DataFrame(pullback_list)
-    final_with_sim = pd.concat([final_df.reset_index(drop=True), pullback_df], axis=1)
+    final_with_sim = pd.concat([final_filtered.reset_index(drop=True), pullback_df], axis=1)
 
-    # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
-    final_with_sim['target_profit'] = (final_with_sim['support_price'] * 1.20).round(2)
-
-    # 2. 统一保留两位小数
+    # 确保日期格式美化（可选，防止 Excel 里显示长字符串）
+    if 'trade_date' in final_with_sim.columns:
+        final_with_sim['trade_date'] = pd.to_datetime(final_with_sim['trade_date']).dt.strftime('%Y-%m-%d')
     # 自动识别 DataFrame 中存在的浮点数列并取2位小数
     final_with_sim = final_with_sim.round(2)
 
-    # 3. 定义必须非空的字段并剔除包含 NaN 的行
-    # 包含的字段：quarterly_eps_growth, annual_eps_growth, revenue_growth, roe, shares_outstanding, inst_ownership, canslim_score
-    critical_fundamental_cols = [
-        'quarterly_eps_growth', 'annual_eps_growth', 'revenue_growth', 
-        'roe', 'shares_outstanding', 'inst_ownership', "fcf_quality", 'canslim_score'
-    ]
-    # 4. 剔除基本面分数为 NaN 的股票
-    # 这会过滤掉那些 yfinance 无法获取财务数据或不符合初步基本面条件的股票
-    before_count = len(final_with_sim)
-    final_with_sim = final_with_sim.dropna(subset=critical_fundamental_cols)
-    after_count = len(final_with_sim)
-    print(f"🧹 已剔除基本面数据不全的股票: {before_count - after_count} 只")
-
-    # 5. 确保日期格式美化（可选，防止 Excel 里显示长字符串）
-    if 'trade_date' in final_with_sim.columns:
-        final_with_sim['trade_date'] = pd.to_datetime(final_with_sim['trade_date']).dt.strftime('%Y-%m-%d')
-    if 'support_date' in final_with_sim.columns:
-        final_with_sim['support_date'] = pd.to_datetime(final_with_sim['support_date']).dt.strftime('%Y-%m-%d')
-
-    # 9️⃣ 打印输出
+    # 7️⃣ 最终打印输出
+    print("\n✅ 最终买入候选及波动模拟 (含 VIX 调节)")
+    print("-" * 150)
     display_cols = [
-        "stock_code",
-        "support_date", "support_price",
-        "breakthrough_date", "breakthrough_price",
-        "dip_date", "dip_price",
-        "rs_rank",
-        "hard_stop", "target_profit", "ideal_entry",
-        "canslim_score",
-        "quarterly_eps_growth", "annual_eps_growth",
-        "revenue_growth", "roe",
-        "shares_outstanding", "inst_ownership", "fcf_quality"
+        "is_current_hold", "stock_code", "close", 
+        "ideal_entry", "hard_stop", "vix_adj", "rs_rank", "canslim_score"
     ]
-    
-    # 过滤掉不存在的列以防报错
-    actual_cols = [c for c in display_cols if c in final_with_sim.columns]
-    print(final_with_sim[actual_cols].to_string(index=False))
+    print(final_with_sim[display_cols].to_string(index=False))
 
     # 保存结果
     if not final_with_sim.empty:
-        file_name_xlsx = f"fourty_days_breakthrough_with_dip_{datetime.now():%Y%m%d}.xlsx"
+        file_name_xlsx = f"swing_strategy_vix_sim_v2_{datetime.now():%Y%m%d}.xlsx"
         try:
-            final_with_sim[actual_cols].to_excel(file_name_xlsx, index=False, engine='openpyxl')
+            final_with_sim.to_excel(file_name_xlsx, index=False, engine='openpyxl')
             print(f"\n📊 详细策略报告已生成 Excel: {file_name_xlsx}")
         except Exception as e:
             print(f"❌ Excel 生成失败 (请检查是否安装 openpyxl): {e}")
