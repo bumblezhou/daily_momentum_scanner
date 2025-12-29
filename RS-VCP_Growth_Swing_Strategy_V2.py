@@ -606,25 +606,33 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         AND (
             (
                 /* ===== 1. 基础结构：即使去掉了均线，也要保证不是垃圾股 ===== */
+                /* 均线排列参数标准：保守：close > ma50 > ma150 > ma200， 标准：close > ma150 AND ma50 > ma150 > ma200， 激进：close > ma50 AND ma50 > ma200 */
                 b.close > b.ma150
-                AND b.ma150 > b.ma200
                 AND b.ma50  > b.ma150
+                AND b.ma150 > b.ma200
+                /* 距离 52 周低点：保守：close >= 1.5 * low_52w， 标准： close >= 1.25 * low_52w， 激进： close >= 1.15 * low_52w */
                 AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
                 AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
 
+                /* 均线斜率参数标准：保守： ma150 > LAG(ma150, 20)， 标准： ma150 >= LAG(ma150, 20)， 激进： 不要求 */
+
                 /* ===== 2. RS 强度：保留，这是核心，但稍微放宽排名 ===== */
-                AND r.rs_rank >= 70           -- 稍微提高排名要求，保证强者恒强
-                /* 注释掉苛刻的RS加速要求，允许RS走平 */
-                -- AND r.rs_20 > r.rs_20_10days_ago 
+                /* RS Rank（全市场）参数标准：保守：rs_rank >= 80，标准：rs_rank >= 70，激进：rs_rank >= 60，严禁低于 55（55 以下长期统计期望≈0）*/
+                AND r.rs_rank >= 75           -- 稍微提高排名要求，保证强者恒强
+                /* 注释掉苛刻的RS加速要求，允许RS走平。收紧到 0.95，不能明显走弱 */
+                /* RS 持续性参数标准： 保守：rs_20 > rs_20_10days_ago， 标准：rs_20 > rs_20_10days_ago * 0.95， 激进：不强制，但不允许明显下行 */
+                AND r.rs_20 > r.rs_20_10days_ago * 0.95
 
                 /* ===== 3. VCP 形态：放宽波动收缩阈值 ===== */
-                /* 将 0.8 放宽到 0.95，只要近期没有剧烈波动即可 */
+                /* 将 0.8 放宽到 0.95，只要近期没有剧烈波动即可。 */
+                /* ATR 收缩强度参数标准： 保守：atr5 / atr20 < 0.85， 标准：atr5 / atr20 < 0.95， 激进：atr5 / atr20 < 1.0 */
                 AND (a.atr5 / NULLIF(a.atr20, 0)) < 0.95 
                 
                 /* 注释掉 slope < 0，有时候震荡期 slope 是平的 */
                 -- AND a.atr_slope < 0
                 
                 /* 保留：短期比长期稳定 */
+                /* 长短波动对比参数对比： 保守： atr5 < atr20 AND atr15 < atr60， 标准： atr15 < atr60， 激进： atr15 <= atr60 * 1.05 */
                 AND a.atr15 < a.atr60
 
                 /* ===== 4. 关键修改：移除“当天必须爆发”的条件 ===== */
@@ -637,7 +645,14 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
                 */
                 
                 /* 替代方案：只要成交量不要已经枯竭到死寂即可，或者完全不限 */
-                AND v.volume > 100000 -- 保证流动性即可
+                /* 成交量参数标准： 保守： vol20 > 1_000_000， 标准： vol20 > 300_000， 激进： vol20 > 150_000 */
+                AND v.vol20 > 500000
+
+                /* 市值参数标准： 保守： market_cap > 5e9， 标准： market_cap > 1e9， 激进： market_cap > 不强制 */
+                AND EXISTS (
+                    SELECT 1 FROM stock_fundamentals f
+                    WHERE f.stock_code = b.stock_code AND f.market_cap >= 1e9
+                )
             )
             OR
             b.stock_code IN ({monitor_str})
@@ -756,6 +771,19 @@ def update_fundamentals(con, ticker_list, force_update=False):
                 SET sector = ?, industry = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE symbol = ?
             """, (sector, industry, symbol))
+
+            # 标准行业分类参考：
+            # "Technology"
+            # "Healthcare"
+            # "Financial Services"
+            # "Energy"
+            # "Basic Materials"
+            # "Industrials"
+            # "Consumer Cyclical"
+            # "Consumer Defensive"
+            # "Communication Services"
+            # "Utilities"
+            # "Real Estate"
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
