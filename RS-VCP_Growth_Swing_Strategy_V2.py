@@ -41,6 +41,8 @@ def init_db():
             mic TEXT,
             currency TEXT,
             type TEXT,
+            sector TEXT,
+            industry TEXT,
             updated_at TIMESTAMP
         )
     """)
@@ -526,8 +528,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
             AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 59 PRECEDING) AS atr60,
             AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 9 PRECEDING)  AS atr10,
             AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 49 PRECEDING) AS atr50,
-            (avg10.atr10_recent -
-             LAG(avg10.atr10_recent, 10) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date)) / 10 AS atr_slope
+            (avg10.atr10_recent - LAG(avg10.atr10_recent, 10) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date)) / 10 AS atr_slope
         FROM atr_raw a
         JOIN atr_10day_avg avg10 USING (stock_code, trade_date)
     ),
@@ -605,9 +606,11 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         AND (
             (
                 /* ===== 1. 基础结构：即使去掉了均线，也要保证不是垃圾股 ===== */
-                b.close >= 5.0                -- 股价大于5元，过滤仙股
-                AND b.close >= 1.10 * b.low_52w   -- 放宽：距52周低点至少+10%
-                AND b.close >= 0.70 * b.high_52w  -- 放宽：距52周高点不超过-30%
+                b.close > b.ma150
+                AND b.ma150 > b.ma200
+                AND b.ma50  > b.ma150
+                AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
+                AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
 
                 /* ===== 2. RS 强度：保留，这是核心，但稍微放宽排名 ===== */
                 AND r.rs_rank >= 70           -- 稍微提高排名要求，保证强者恒强
@@ -744,6 +747,15 @@ def update_fundamentals(con, ticker_list, force_update=False):
 
             # --- 金律字段提取 ---
             market_cap = info.get('marketCap', 0) or 0
+
+            # 更新 sector 和 industry
+            sector = info.get("sector")
+            industry = info.get("industry")
+            con.execute("""
+                UPDATE stock_ticker
+                SET sector = ?, industry = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE symbol = ?
+            """, (sector, industry, symbol))
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
@@ -861,7 +873,7 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE"]
+CURRENT_SELECTED_TICKERS = ["CDE", "TLSA", "COLL"]
 # CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
