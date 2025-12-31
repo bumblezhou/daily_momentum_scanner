@@ -972,7 +972,7 @@ def main():
     qqq_ma50 = qqq_df['ma50'].iloc[0]
 
     if not (spy_close > spy_ma200 and qqq_close > qqq_ma50):
-        print("⚠️ 市场 Regime 不满足 (SPY < MA200 或 QQQ < MA50)，今日不交易。")
+        print(f"⚠️ 市场 Regime 不满足 【SPY({spy_close:.2f}) < SPY_MA200({spy_ma200:.2f}) 或 QQQ({qqq_close:.2f}) < QQQ_MA50({qqq_ma50:.2f})】，今日不交易。")
         return
 
     print("✅ 市场 Regime 满足，继续筛选。")
