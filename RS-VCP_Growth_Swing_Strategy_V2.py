@@ -393,34 +393,34 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
 
     WITH base AS (
         SELECT
-            stock_code,
-            trade_date,
-            close,
-            high,
-            low,
-            volume,
-
+            p.stock_code,
+            p.trade_date,
+            p.close,
+            p.high,
+            p.low,
+            p.volume,
+            t.sector,
             /* ===== 均线参数（可调） ===== */
-            AVG(close) OVER w10  AS ma10,    -- 短线持仓用
-            AVG(close) OVER w20  AS ma20,    -- 新增：用于止损和VCP
-            AVG(close) OVER w50  AS ma50,
-            AVG(close) OVER w150 AS ma150,
-            AVG(close) OVER w200 AS ma200,
-
+            AVG(p.close) OVER w10  AS ma10,    -- 短线持仓用
+            AVG(p.close) OVER w20  AS ma20,    -- 新增：用于止损和VCP
+            AVG(p.close) OVER w50  AS ma50,
+            AVG(p.close) OVER w150 AS ma150,
+            AVG(p.close) OVER w200 AS ma200,
             /* ===== 52 周高低点窗口（252 日） ===== */
-            MAX(high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
-            MIN(low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
+            MAX(p.high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
+            MIN(p.low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
 
             COUNT(*) OVER w_all AS trading_days
-        FROM stock_price
+        FROM stock_price p
+        LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
         WINDOW
-            w10  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING),
-            w20  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING),
-            w50  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 49 PRECEDING),
-            w150 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 149 PRECEDING),
-            w200 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 199 PRECEDING),
-            w252 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 251 PRECEDING),
-            w_all AS (PARTITION BY stock_code)
+            w10  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 9 PRECEDING),
+            w20  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 19 PRECEDING),
+            w50  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 49 PRECEDING),
+            w150 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 149 PRECEDING),
+            w200 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 199 PRECEDING),
+            w252 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 251 PRECEDING),
+            w_all AS (PARTITION BY p.stock_code)
     ),
 
     /* ===== RS Rank 计算（Minervini 权重） ===== */
@@ -584,6 +584,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         b.stock_code,
         b.trade_date,
         b.close,
+        b.sector,
         r.rs_rank,
         b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
         b.high_52w, b.low_52w,
@@ -618,7 +619,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
 
                 /* ===== 2. RS 强度：保留，这是核心，但稍微放宽排名 ===== */
                 /* RS Rank（全市场）参数标准：保守：rs_rank >= 80，标准：rs_rank >= 70，激进：rs_rank >= 60，严禁低于 55（55 以下长期统计期望≈0）*/
-                AND r.rs_rank >= 75           -- 稍微提高排名要求，保证强者恒强
+                AND ((r.rs_rank >= 75) OR (b.sector = 'Technology' AND r.rs_rank >= 65))  -- 保证强者恒强，允许科技、医疗、消费周期股稍微低一点
                 /* 注释掉苛刻的RS加速要求，允许RS走平。收紧到 0.95，不能明显走弱 */
                 /* RS 持续性参数标准： 保守：rs_20 > rs_20_10days_ago， 标准：rs_20 > rs_20_10days_ago * 0.95， 激进：不强制，但不允许明显下行 */
                 AND r.rs_20 > r.rs_20_10days_ago * 0.95
@@ -1052,7 +1053,7 @@ def main():
         "hard_stop", "target_profit", "canslim_score",
         "quarterly_eps_growth", "annual_eps_growth",
         "revenue_growth", "roe", "shares_outstanding", 
-        "inst_ownership", "fcf_quality", "market_cap"
+        "inst_ownership", "fcf_quality", "market_cap", 'sector'
     ]
     print(final_with_sim[display_cols].to_string(index=False))
 
