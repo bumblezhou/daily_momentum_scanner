@@ -41,6 +41,8 @@ def init_db():
             mic TEXT,
             currency TEXT,
             type TEXT,
+            sector TEXT,
+            industry TEXT,
             updated_at TIMESTAMP
         )
     """)
@@ -427,6 +429,15 @@ def update_fundamentals(ticker_list, force_update=False):
 
             # --- 金律字段提取 ---
             market_cap = info.get('marketCap', 0) or 0
+
+            # 更新 sector 和 industry
+            sector = info.get("sector")
+            industry = info.get("industry")
+            con.execute("""
+                UPDATE stock_ticker
+                SET sector = ?, industry = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE symbol = ?
+            """, (sector, industry, symbol))
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
@@ -621,6 +632,7 @@ def filter_dip_stocks_from_db(target_date_str: str):
         dip_price,
         high,
         low,
+        volume,
         volatility,
         avg_dollar_volume
     FROM C_Dip
@@ -758,7 +770,7 @@ def main():
     final_with_sim = pd.concat([final_df.reset_index(drop=True), pullback_df], axis=1)
 
     # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
-    final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
+    final_with_sim['target_profit'] = (final_with_sim['support_price'] * 1.20).round(2)
 
     # 2. 统一保留两位小数
     # 自动识别 DataFrame 中存在的浮点数列并取2位小数
