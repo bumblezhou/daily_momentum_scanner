@@ -41,6 +41,8 @@ def init_db():
             mic TEXT,
             currency TEXT,
             type TEXT,
+            sector TEXT,
+            industry TEXT,
             updated_at TIMESTAMP
         )
     """)
@@ -391,34 +393,34 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
 
     WITH base AS (
         SELECT
-            stock_code,
-            trade_date,
-            close,
-            high,
-            low,
-            volume,
-
+            p.stock_code,
+            p.trade_date,
+            p.close,
+            p.high,
+            p.low,
+            p.volume,
+            t.sector,
             /* ===== 均线参数（可调） ===== */
-            AVG(close) OVER w10  AS ma10,    -- 短线持仓用
-            AVG(close) OVER w20  AS ma20,    -- 新增：用于止损和VCP
-            AVG(close) OVER w50  AS ma50,
-            AVG(close) OVER w150 AS ma150,
-            AVG(close) OVER w200 AS ma200,
-
+            AVG(p.close) OVER w10  AS ma10,    -- 短线持仓用
+            AVG(p.close) OVER w20  AS ma20,    -- 新增：用于止损和VCP
+            AVG(p.close) OVER w50  AS ma50,
+            AVG(p.close) OVER w150 AS ma150,
+            AVG(p.close) OVER w200 AS ma200,
             /* ===== 52 周高低点窗口（252 日） ===== */
-            MAX(high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
-            MIN(low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
+            MAX(p.high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
+            MIN(p.low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
 
             COUNT(*) OVER w_all AS trading_days
-        FROM stock_price
+        FROM stock_price p
+        LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
         WINDOW
-            w10  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING),
-            w20  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING),
-            w50  AS (PARTITION BY stock_code ORDER BY trade_date ROWS 49 PRECEDING),
-            w150 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 149 PRECEDING),
-            w200 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 199 PRECEDING),
-            w252 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 251 PRECEDING),
-            w_all AS (PARTITION BY stock_code)
+            w10  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 9 PRECEDING),
+            w20  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 19 PRECEDING),
+            w50  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 49 PRECEDING),
+            w150 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 149 PRECEDING),
+            w200 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 199 PRECEDING),
+            w252 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 251 PRECEDING),
+            w_all AS (PARTITION BY p.stock_code)
     ),
 
     /* ===== RS Rank 计算（Minervini 权重） ===== */
@@ -526,8 +528,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
             AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 59 PRECEDING) AS atr60,
             AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 9 PRECEDING)  AS atr10,
             AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 49 PRECEDING) AS atr50,
-            (avg10.atr10_recent -
-             LAG(avg10.atr10_recent, 10) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date)) / 10 AS atr_slope
+            (avg10.atr10_recent - LAG(avg10.atr10_recent, 10) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date)) / 10 AS atr_slope
         FROM atr_raw a
         JOIN atr_10day_avg avg10 USING (stock_code, trade_date)
     ),
@@ -583,6 +584,7 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         b.stock_code,
         b.trade_date,
         b.close,
+        b.sector,
         r.rs_rank,
         b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
         b.high_52w, b.low_52w,
@@ -605,23 +607,33 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
         AND (
             (
                 /* ===== 1. 基础结构：即使去掉了均线，也要保证不是垃圾股 ===== */
-                b.close >= 5.0                -- 股价大于5元，过滤仙股
-                AND b.close >= 1.10 * b.low_52w   -- 放宽：距52周低点至少+10%
-                AND b.close >= 0.70 * b.high_52w  -- 放宽：距52周高点不超过-30%
+                /* 均线排列参数标准：保守：close > ma50 > ma150 > ma200， 标准：close > ma150 AND ma50 > ma150 > ma200， 激进：close > ma50 AND ma50 > ma200 */
+                b.close > b.ma150
+                AND b.ma50  > b.ma150
+                AND b.ma150 > b.ma200
+                /* 距离 52 周低点：保守：close >= 1.5 * low_52w， 标准： close >= 1.25 * low_52w， 激进： close >= 1.15 * low_52w */
+                AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
+                AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
+
+                /* 均线斜率参数标准：保守： ma150 > LAG(ma150, 20)， 标准： ma150 >= LAG(ma150, 20)， 激进： 不要求 */
 
                 /* ===== 2. RS 强度：保留，这是核心，但稍微放宽排名 ===== */
-                AND r.rs_rank >= 70           -- 稍微提高排名要求，保证强者恒强
-                /* 注释掉苛刻的RS加速要求，允许RS走平 */
-                -- AND r.rs_20 > r.rs_20_10days_ago 
+                /* RS Rank（全市场）参数标准：保守：rs_rank >= 80，标准：rs_rank >= 70，激进：rs_rank >= 60，严禁低于 55（55 以下长期统计期望≈0）*/
+                AND ((r.rs_rank >= 75) OR (b.sector = 'Technology' AND r.rs_rank >= 65))  -- 保证强者恒强，允许科技、医疗、消费周期股稍微低一点
+                /* 注释掉苛刻的RS加速要求，允许RS走平。收紧到 0.95，不能明显走弱 */
+                /* RS 持续性参数标准： 保守：rs_20 > rs_20_10days_ago， 标准：rs_20 > rs_20_10days_ago * 0.95， 激进：不强制，但不允许明显下行 */
+                AND r.rs_20 > r.rs_20_10days_ago * 0.95
 
                 /* ===== 3. VCP 形态：放宽波动收缩阈值 ===== */
-                /* 将 0.8 放宽到 0.95，只要近期没有剧烈波动即可 */
+                /* 将 0.8 放宽到 0.95，只要近期没有剧烈波动即可。 */
+                /* ATR 收缩强度参数标准： 保守：atr5 / atr20 < 0.85， 标准：atr5 / atr20 < 0.95， 激进：atr5 / atr20 < 1.0 */
                 AND (a.atr5 / NULLIF(a.atr20, 0)) < 0.95 
                 
                 /* 注释掉 slope < 0，有时候震荡期 slope 是平的 */
                 -- AND a.atr_slope < 0
                 
                 /* 保留：短期比长期稳定 */
+                /* 长短波动对比参数对比： 保守： atr5 < atr20 AND atr15 < atr60， 标准： atr15 < atr60， 激进： atr15 <= atr60 * 1.05 */
                 AND a.atr15 < a.atr60
 
                 /* ===== 4. 关键修改：移除“当天必须爆发”的条件 ===== */
@@ -634,7 +646,14 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
                 */
                 
                 /* 替代方案：只要成交量不要已经枯竭到死寂即可，或者完全不限 */
-                AND v.volume > 100000 -- 保证流动性即可
+                /* 成交量参数标准： 保守： vol20 > 1_000_000， 标准： vol20 > 300_000， 激进： vol20 > 150_000 */
+                AND v.vol20 > 500000
+
+                /* 市值参数标准： 保守： market_cap > 5e9， 标准： market_cap > 1e9， 激进： market_cap > 不强制 */
+                AND EXISTS (
+                    SELECT 1 FROM stock_fundamentals f
+                    WHERE f.stock_code = b.stock_code AND f.market_cap >= 1e9
+                )
             )
             OR
             b.stock_code IN ({monitor_str})
@@ -744,6 +763,28 @@ def update_fundamentals(con, ticker_list, force_update=False):
 
             # --- 金律字段提取 ---
             market_cap = info.get('marketCap', 0) or 0
+
+            # 更新 sector 和 industry
+            sector = info.get("sector")
+            industry = info.get("industry")
+            con.execute("""
+                UPDATE stock_ticker
+                SET sector = ?, industry = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE symbol = ?
+            """, (sector, industry, symbol))
+
+            # 标准行业分类参考：
+            # "Technology"
+            # "Healthcare"
+            # "Financial Services"
+            # "Energy"
+            # "Basic Materials"
+            # "Industrials"
+            # "Consumer Cyclical"
+            # "Consumer Defensive"
+            # "Communication Services"
+            # "Utilities"
+            # "Real Estate"
             
             # 提取 CAN SLIM 指标
             quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
@@ -861,7 +902,7 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE"]
+CURRENT_SELECTED_TICKERS = ["CDE", "TLSA", "COLL"]
 # CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
@@ -931,7 +972,7 @@ def main():
     qqq_ma50 = qqq_df['ma50'].iloc[0]
 
     if not (spy_close > spy_ma200 and qqq_close > qqq_ma50):
-        print("⚠️ 市场 Regime 不满足 (SPY < MA200 或 QQQ < MA50)，今日不交易。")
+        print(f"⚠️ 市场 Regime 不满足 【SPY({spy_close:.2f}) < SPY_MA200({spy_ma200:.2f}) 或 QQQ({qqq_close:.2f}) < QQQ_MA50({qqq_ma50:.2f})】，今日不交易。")
         return
 
     print("✅ 市场 Regime 满足，继续筛选。")
@@ -1012,7 +1053,7 @@ def main():
         "hard_stop", "target_profit", "canslim_score",
         "quarterly_eps_growth", "annual_eps_growth",
         "revenue_growth", "roe", "shares_outstanding", 
-        "inst_ownership", "fcf_quality", "market_cap"
+        "inst_ownership", "fcf_quality", "market_cap", 'sector'
     ]
     print(final_with_sim[display_cols].to_string(index=False))
 
