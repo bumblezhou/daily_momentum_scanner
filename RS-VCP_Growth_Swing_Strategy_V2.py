@@ -379,9 +379,7 @@ def update_recent_prices(watchlist: list = []):
 # Stage 2：SwingTrend 技术筛选（全部在 DuckDB 内完成）
 # ============================================================
 
-def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.DataFrame:
-    con = duckdb.connect(DUCKDB_PATH)
-
+def build_stage2_swingtrend(con, target_date: date, monitor_list: list = []) -> pd.DataFrame:
     # 将列表转换为 SQL 字符串格式 ('AAPL', 'TSLA')
     monitor_str = ", ".join([f"'{t}'" for t in monitor_list]) if monitor_list else "''"
 
@@ -662,18 +660,15 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = []) -> pd.Da
     """
 
     df = con.execute(sql).df()
-    con.close()
     return df
 
 
-def build_stage3_fundamental_fast(stage2_df: pd.DataFrame) -> pd.DataFrame:
+def build_stage3_fundamental_fast(con, stage2_df: pd.DataFrame) -> pd.DataFrame:
     """
     从本地 DuckDB 直接获取基本面评分 (极速版)
     """
     if stage2_df.empty:
         return pd.DataFrame()
-    
-    con = duckdb.connect(DUCKDB_PATH)
 
     # 将 Stage 2 的结果注册为临时表，方便与基本面表 JOIN
     con.register("tmp_stage2", stage2_df)
@@ -699,7 +694,6 @@ def build_stage3_fundamental_fast(stage2_df: pd.DataFrame) -> pd.DataFrame:
     """
     
     result_df = con.execute(sql).df()
-    con.close()
     return result_df
 
 
@@ -827,13 +821,12 @@ def get_latest_date_in_db():
 
 
 # ==================== 新增：回撤深度与波动模拟函数（修复版）===================
-def simulate_pullback_range(stock_code, current_vix=18.0):
+def simulate_pullback_range(con, stock_code, current_vix=18.0):
     """
     基于 ATR、历史回撤及 VIX 动态调节因子模拟入场区间与硬止损
     :param stock_code: 股票代码
     :param current_vix: 当前市场 VIX 指数，默认 18.0 (基准均值)
     """
-    con = duckdb.connect(DUCKDB_PATH)
     
     # 直接在 SQL 中计算所需的 ma20 和 pivot_price（因为原始表没有这些列）
     sql = f"""
@@ -853,13 +846,11 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
     """
     try:
         df = con.execute(sql).df().sort_values('trade_date')  # 按时间升序方便计算 ATR
-        con.close()
         if len(df) < 20:
             print(f"⚠️ {stock_code} 数据不足20条，无法计算波动区间")
             return {}
     except Exception as e:
         print(f"提取 {stock_code} 波动数据失败: {e}")
-        con.close()
         return {}
 
     # --- A. 计算 15日 ATR (真实波幅) ---
@@ -902,7 +893,7 @@ def simulate_pullback_range(stock_code, current_vix=18.0):
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE", "TLSA", "COLL"]
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "AAPL", "MSFT", "AMZN", "META", "NFLX", "INTC"]
 # CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
@@ -960,7 +951,7 @@ def main():
         )
     """
     qqq_df = con.execute(qqq_sql).df()
-    con.close()
+    
 
     if spy_df.empty or qqq_df.empty:
         print("❌ SPY或QQQ数据缺失，无法检查 Regime。")
@@ -971,15 +962,15 @@ def main():
     qqq_close = qqq_df['close'].iloc[0]
     qqq_ma50 = qqq_df['ma50'].iloc[0]
 
-    if not (spy_close > spy_ma200 and qqq_close > qqq_ma50):
-        print(f"⚠️ 市场 Regime 不满足 【SPY({spy_close:.2f}) < SPY_MA200({spy_ma200:.2f}) 或 QQQ({qqq_close:.2f}) < QQQ_MA50({qqq_ma50:.2f})】，今日不交易。")
-        return
+    # if not (spy_close > spy_ma200 and qqq_close > qqq_ma50):
+    #     print(f"⚠️ 市场 Regime 不满足 【SPY({spy_close:.2f}) < SPY_MA200({spy_ma200:.2f}) 或 QQQ({qqq_close:.2f}) < QQQ_MA50({qqq_ma50:.2f})】，今日不交易。")
+    #     return
 
     print("✅ 市场 Regime 满足，继续筛选。")
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    stage2 = build_stage2_swingtrend(latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS)
+    stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS)
     print(f"Stage 2 股票数量: {len(stage2)}")
 
     if stage2.empty:
@@ -988,7 +979,7 @@ def main():
 
     # 5️⃣ Stage 3: 基本面分析
     print("📊 Stage 3: 基本面分析")
-    stage3 = build_stage3_fundamental_fast(stage2)
+    stage3 = build_stage3_fundamental_fast(con, stage2)
     # stage3 = build_stage3_fundamental(stage2)
 
     # 合并结果
@@ -1028,8 +1019,11 @@ def main():
     print("🛠️ 正在计算个股波动容错区间...")
     pullback_list = []
     for ticker in final_filtered['stock_code']:
-        p_data = simulate_pullback_range(ticker, current_vix=current_vix)
+        p_data = simulate_pullback_range(con, ticker, current_vix=current_vix)
         pullback_list.append(p_data if p_data else {})
+    
+    # 关闭连接
+    con.close()
     
     # 合并模拟结果
     pullback_df = pd.DataFrame(pullback_list)
