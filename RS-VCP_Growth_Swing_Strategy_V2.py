@@ -1414,18 +1414,31 @@ def update_volume_trend_features(con, latest_trading_day: str):
 
 
 # Define a function to classify based on slopes
-def classify_obv_ad(obv_slope, ad_slope, eps_ratio=0.05):
-    # 附加量价趋势特征
-    # OBV + AD 组合的“机构级含义”
-    # 情况	        解读
-    # OBV ↑ + AD ↑	明确吸筹(最强)
-    # OBV ↑ + AD →	洗盘(震荡)
-    # OBV → + AD ↓	派发前兆(见顶)
-    # OBV ↓ + AD ↓	趋势结束(最弱)
+def classify_obv_ad_enhanced(
+    obv_slope,
+    ad_slope,
+    vol20=None,
+    vix=None,
+    eps_ratio=0.05
+):
+    """
+    增强版 OBV + AD 量价结构解释器
+    - obv_slope: On-Balance Volume 斜率 （数值型）
+    - ad_slope: Accumulation/Distribution 斜率 （数值型）
+    - vol20: 20日均量（可选，用于后续扩展）
+    - vix: 当前 VIX 指数（可选，用于动态调整阈值）
+    - eps_ratio: 噪声阈值比例，默认 5% (可调)
+    返回分类标签字符串
+    """
+
     if pd.isna(obv_slope) or pd.isna(ad_slope):
         return "未分类"
 
-    # 动态容忍区间（防止微小噪声）
+    # === 动态噪声阈值 ===
+    # VIX 高 → 放宽中性区
+    if vix is not None and vix > 18:
+        eps_ratio = 0.10
+
     eps_obv = abs(obv_slope) * eps_ratio
     eps_ad  = abs(ad_slope) * eps_ratio
 
@@ -1440,19 +1453,19 @@ def classify_obv_ad(obv_slope, ad_slope, eps_ratio=0.05):
     obv_trend = trend(obv_slope, eps_obv)
     ad_trend  = trend(ad_slope, eps_ad)
 
-    # === 强趋势 ===
+    # ===== 强趋势 =====
     if obv_trend == '↑' and ad_trend == '↑':
         return "明确吸筹(最强)"
     if obv_trend == '↓' and ad_trend == '↓':
         return "趋势结束(最弱)"
 
-    # === 分歧结构（非常重要）===
+    # ===== 资金分歧 =====
     if obv_trend == '↑' and ad_trend == '↓':
         return "资金分歧(内强外弱)"
     if obv_trend == '↓' and ad_trend == '↑':
         return "价格拉升但量未确认"
 
-    # === 过渡 / 震荡 ===
+    # ===== 震荡 / 过渡 =====
     if obv_trend == '↑' and ad_trend == '→':
         return "洗盘(震荡)"
     if obv_trend == '→' and ad_trend == '↓':
@@ -1465,7 +1478,7 @@ def classify_obv_ad(obv_slope, ad_slope, eps_ratio=0.05):
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "AAPL", "MSFT", "AMZN", "META", "NFLX", "INTC"]
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "ORCL", "CDE"]
 # CURRENT_SELECTED_TICKERS = []
 # ===============================================
 
@@ -1576,7 +1589,12 @@ def main():
     # 量价趋势特征解读
     eps_ratio = 0.05 if current_vix < 18 else 0.1
     final_with_sim['obv_ad_interpretation'] = final_with_sim.apply(
-        lambda row: classify_obv_ad(row['obv_slope_20'], row['ad_slope_20'], eps_ratio),
+        lambda row: classify_obv_ad_enhanced(
+            row.get('obv_slope_20'),
+            row.get('ad_slope_20'),
+            vol20=row.get('vol20'),
+            vix=current_vix if 'current_vix' in globals() else None
+        ),
         axis=1
     )
 
