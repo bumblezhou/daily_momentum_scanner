@@ -1,3 +1,4 @@
+from functools import partial
 import requests
 import pandas as pd
 import duckdb
@@ -707,11 +708,12 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
                 /* RS 不能明显走弱，允许横盘 */
                 AND r.rs_20 >= r.rs_20_10days_ago * 0.90
 
-                /* ===== 4. 波动结构（允许轻微扩散） =====
-                不强制典型 VCP，只要不是失控即可
+                /* ===== 4. 波动结构 =====
+                典型 VCP, 确保收缩, 而不是平坦或扩散
                 */
-                AND (a.atr5 / NULLIF(a.atr20, 0)) < 1.00
-                AND a.atr15 <= a.atr60 * 1.05
+                AND (a.atr5 / NULLIF(a.atr20, 0)) < 0.95
+                AND a.atr_slope < 0
+                AND a.atr15 <= a.atr60 * 1.00
 
                 /* ===== 5. 成交量底线 =====
                 只排除流动性明显不足的股票
@@ -1032,6 +1034,7 @@ def build_stage3_fundamental_fast(con, stage2_df: pd.DataFrame) -> pd.DataFrame:
             f.canslim_score,
             f.quarterly_eps_growth,
             f.annual_eps_growth,
+            f.forward_eps_growth,
             f.roe,
             f.revenue_growth,
             f.fcf_quality,
@@ -1061,7 +1064,8 @@ def init_fundamental_table(con):
             inst_ownership DOUBLE,                    -- I: 机构持仓比例（heldPercentInstitutions）
             fcf_quality DOUBLE,                       -- 自由现金流质量（fcf / ocf）
             canslim_score INTEGER,                    -- CAN SLIM 综合得分（代码中计算）
-            market_cap BIGINT                         -- 市值（marketCap）
+            market_cap BIGINT,                        -- 市值（marketCap）
+            forward_eps_growth DOUBLE                 -- L: 前瞻每股收益增长率（计算得出）
         );
     """)
 
@@ -1138,6 +1142,11 @@ def update_fundamentals(con, ticker_list, force_update=False):
             inst_own = info.get("heldPercentInstitutions")  # I
             fcf = info.get("freeCashflow")
             ocf = info.get("operatingCashflow")
+            # 计算前瞻每股收益增长率
+            # forward_eps_growth = (info.get('forwardEps', 0) / info.get('trailingEps', 1) - 1) if info.get('trailingEps') else None
+            current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+            target_mean_price = info.get('targetMeanPrice')
+            # 计算自由现金流质量
             fcf_quality = (fcf / ocf) if (fcf and ocf and ocf > 0) else None
 
             # 计算 CAN SLIM 分数 (简化：每个组件达标加1分)
@@ -1147,14 +1156,20 @@ def update_fundamentals(con, ticker_list, force_update=False):
             if rev_growth and rev_growth > 0.15: score += 1  # 营收辅助
             if shares_outstanding and shares_outstanding < 100000000: score += 1  # S: 低股本 <1亿股 (可调)
             if inst_own and inst_own > 0.5: score += 1  # I: 机构 >50%
+            # if forward_eps_growth > 0.20: score += 1  # L: 前瞻 EPS 增长 >20%
+            if current_price and target_mean_price and current_price > 0:
+                implied_growth = (target_mean_price / current_price) - 1
+                if implied_growth > 0.20:  # 分析师预期上涨 >20%
+                    score += 1
+            if fcf_quality is not None and fcf_quality > 0.8: score += 1  # 高质量现金转化
             # N/L/M 在技术筛选中处理
 
             # 使用 UPSERT 逻辑
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap
+                symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap, 0
             ))
 
         except Exception as e:
@@ -1298,7 +1313,15 @@ def check_market_regime(con) -> dict:
     qqq_close = qqq_df['close'].iloc[0]
     qqq_ma50 = qqq_df['ma50'].iloc[0]
 
-    is_bull = (spy_close > spy_ma200) and (qqq_close > qqq_ma50)
+    # 添加 RSI 计算（可选）
+    spy_prices = con.execute("SELECT close FROM stock_price WHERE stock_code='SPY' ORDER BY trade_date DESC LIMIT 14").df()['close']
+    delta = spy_prices.diff()
+    gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+    loss = -delta.clip(upper=0).ewm(span=14, adjust=False).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs.iloc[-1]))
+
+    is_bull = (spy_close > spy_ma200) and (qqq_close > qqq_ma50) and (rsi < 70)  # 避免超买
 
     return {
         "is_bull": is_bull,
@@ -1435,9 +1458,9 @@ def classify_obv_ad_enhanced(
         return "未分类"
 
     # === 动态噪声阈值 ===
-    # VIX 高 → 放宽中性区
-    if vix is not None and vix > 18:
-        eps_ratio = 0.10
+    # VIX 高 → 放宽中性区间，避免误判
+    if vix is not None and vix > 20:
+        eps_ratio = 0.08
 
     eps_obv = abs(obv_slope) * eps_ratio
     eps_ad  = abs(ad_slope) * eps_ratio
@@ -1489,7 +1512,7 @@ OBV_AD_WATCHLIST = {
     "资金分歧(内强外弱)"
 }
 
-def obv_ad_trade_gate(obv_ad_interpretation: str):
+def obv_ad_trade_gate(obv_ad_interpretation: str, vol20: float = None):
     """
     返回交易资格：
     - allow_trade: bool
@@ -1500,6 +1523,10 @@ def obv_ad_trade_gate(obv_ad_interpretation: str):
 
     if obv_ad_interpretation in OBV_AD_WATCHLIST:
         return True, "仅跟踪"
+    
+    # 低流动性直接禁止
+    if vol20 is not None and vol20 < 500000:          # ← 可根据偏好调整阈值
+        return False, "低流动性禁止"
 
     return True, "允许建仓"
 
@@ -1517,7 +1544,7 @@ OBV_SCORE_MAP = {
 }
 
 
-def compute_trade_score(row):
+def compute_trade_score(row, sector_dict):
     """
     准实盘评分：
     - 技术结构权重 60%
@@ -1531,8 +1558,22 @@ def compute_trade_score(row):
     rs_score = min(row.get('rs_rank', 50) / 100.0, 1.0)
     canslim_score = min(row.get('canslim_score', 0) / 5.0, 1.0)
     technical_score = (obv_score * 0.6 + rs_score * 0.4)
-    final_score = technical_score * 0.6 + canslim_score * 0.4
-    return round(final_score * 100, 2)
+    base_score = technical_score * 0.6 + canslim_score * 0.4
+
+    # 计算行业加成
+    sector_rs = sector_dict.get(row['sector'], 50.0)
+
+    if sector_rs > 75:
+        sector_bonus = 0.12
+    elif sector_rs > 65:
+        sector_bonus = 0.06
+    elif sector_rs < 50:
+        sector_bonus = -0.08
+    else:
+        sector_bonus = 0.0
+
+    final_score = base_score + sector_bonus
+    return round(max(0.0, min(final_score * 100, 100.0)), 2)
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
@@ -1657,14 +1698,25 @@ def main():
     # =========================
     # V3：应用量价交易 Gate
     # =========================
-    gate_result = final_with_sim['obv_ad_interpretation'].apply(obv_ad_trade_gate)
+    gate_result = final_with_sim.apply(
+        lambda row: obv_ad_trade_gate(row['obv_ad_interpretation'], row.get('vol20')),
+        axis=1
+    )
     final_with_sim['allow_trade'] = gate_result.apply(lambda x: x[0])
     final_with_sim['trade_state'] = gate_result.apply(lambda x: x[1])
 
     # =========================
     # V3：生成最终交易评分
     # =========================
-    final_with_sim['trade_score'] = final_with_sim.apply(compute_trade_score, axis=1)
+    # 计算各行业平均 RS 排名
+    sector_avg_rs = final_with_sim.groupby('sector')['rs_rank'].mean().to_dict()
+    # 处理 None 或缺失的 sector（安全起见）
+    sector_avg_rs[None] = 50.0        # 或更保守的值，如 40.0
+    # 使用 partial 固定 sector_dict 参数，生成一个只接受 row 的新函数
+    final_with_sim['trade_score'] = final_with_sim.apply(
+        lambda row: compute_trade_score(row, sector_avg_rs),
+        axis=1
+    )
     final_with_sim = final_with_sim.sort_values(
         by=['trade_state', 'trade_score'],
         ascending=[True, False]
