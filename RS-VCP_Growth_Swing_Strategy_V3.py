@@ -68,9 +68,11 @@ def init_db():
             obv DOUBLE,
             obv_ma20 DOUBLE,
             obv_slope_20 DOUBLE,
+            obv_slope_5 DOUBLE,
             obv_high_60 BOOLEAN,
             ad DOUBLE,
             ad_slope_20 DOUBLE,
+            ad_slope_5 DOUBLE,
             vol20 DOUBLE,
             vol_rs DOUBLE
         )
@@ -1168,9 +1170,8 @@ def update_fundamentals(con, ticker_list, force_update=False):
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
                 VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap, 0
-            ))
+            """, (symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap, 0)
+            )
 
         except Exception as e:
             print(f"  [ERR] {symbol} 更新失败: {e}")
@@ -1348,8 +1349,10 @@ def build_stage2_with_volume_trend(con, stage2_df: pd.DataFrame) -> pd.DataFrame
         v.obv,
         v.obv_ma20,
         v.obv_slope_20,
+        v.obv_slope_5,
         v.ad,
         v.ad_slope_20,
+        v.ad_slope_5,
         v.vol20,
         v.vol_rs
     FROM tmp_stage2 s
@@ -1406,7 +1409,10 @@ def update_volume_trend_features(con, latest_trading_day: str):
             SUM(obv_delta) OVER w AS obv,
 
             /* ===== AD ===== */
-            SUM(ad_delta) OVER w AS ad
+            SUM(ad_delta) OVER w AS ad,
+
+            /* ===== avg_vol_20 ===== */
+            AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) as avg_vol_20
         FROM base
         WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
     ),
@@ -1417,10 +1423,12 @@ def update_volume_trend_features(con, latest_trading_day: str):
             trade_date,
             obv,
             AVG(obv) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING) AS obv_ma20,
-            (obv - LAG(obv, 20) OVER (PARTITION BY stock_code ORDER BY trade_date)) / 20 AS obv_slope_20,
+            (obv - LAG(obv, 20) OVER (PARTITION BY stock_code ORDER BY trade_date)) / NULLIF(avg_vol_20 * 20, 0) AS obv_slope_20,
+            (obv - LAG(obv, 5) OVER (PARTITION BY stock_code ORDER BY trade_date)) / NULLIF(avg_vol_20 * 5, 0) AS obv_slope_5,
             obv >= MAX(obv) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 59 PRECEDING) AS obv_high_60,
             ad,
-            (ad - LAG(ad, 20) OVER (PARTITION BY stock_code ORDER BY trade_date)) / 20 AS ad_slope_20,
+            (ad - LAG(ad, 20) OVER (PARTITION BY stock_code ORDER BY trade_date)) / NULLIF(avg_vol_20 * 20, 0) AS ad_slope_20,
+            (ad - LAG(ad, 5) OVER (PARTITION BY stock_code ORDER BY trade_date)) / NULLIF(avg_vol_20 * 5, 0) AS ad_slope_5,
             AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING) AS vol20,
             volume / NULLIF(AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING), 0) AS vol_rs
         FROM obv_ad
@@ -1436,132 +1444,233 @@ def update_volume_trend_features(con, latest_trading_day: str):
     con.execute(sql)
 
 
-# Define a function to classify based on slopes
+# =========================
+# V3 新增：量价形势判定
+# =========================
 def classify_obv_ad_enhanced(
-    obv_slope,
-    ad_slope,
-    vol20=None,
-    vix=None,
-    eps_ratio=0.05
+    obv_s20,
+    ad_s20,
+    obv_s5,
+    ad_s5,
+    market_regime="多头"
+):
+    STRONG = 0.1 # 只要平均每日净流入达到日均成交量的 10% 就算强
+    WEAK = 0.02
+
+    # 1️⃣ 明确吸筹
+    if obv_s20 > STRONG and ad_s20 > STRONG:
+        if obv_s5 > 0:
+            return "明确吸筹"
+        return "强趋势回撤"
+
+    # 2️⃣ 趋势中资金分歧
+    if obv_s20 > WEAK and ad_s20 < -WEAK:
+        if market_regime == "多头":
+            return "趋势中资金分歧"
+        return "控盘减弱预警"
+
+    # 3️⃣ 底部试探
+    if obv_s20 < -WEAK and obv_s5 > STRONG and ad_s5 > WEAK:
+        return "底部试探"
+
+    # 4️⃣ 明确派发
+    if obv_s20 < -STRONG and ad_s20 < -STRONG:
+        return "派发阶段"
+
+    return "量价中性"
+
+
+def classify_price_trend(
+    ema20,
+    ema50,
+    adx,
+    adx_strong=25,
+    adx_weak=15
 ):
     """
-    增强版 OBV + AD 量价结构解释器
-    - obv_slope: On-Balance Volume 斜率 （数值型）
-    - ad_slope: Accumulation/Distribution 斜率 （数值型）
-    - vol20: 20日均量（可选，用于后续扩展）
-    - vix: 当前 VIX 指数（可选，用于动态调整阈值）
-    - eps_ratio: 噪声阈值比例，默认 5% (可调)
-    返回分类标签字符串
+    价格趋势强度分类
+    只看价格，不看资金
     """
 
-    if pd.isna(obv_slope) or pd.isna(ad_slope):
-        return "未分类"
+    if pd.isna(ema20) or pd.isna(ema50) or pd.isna(adx):
+        return "unknown"
 
-    # === 动态噪声阈值 ===
-    # VIX 高 → 放宽中性区间，避免误判
-    if vix is not None and vix > 20:
-        eps_ratio = 0.08
+    # === 强趋势 ===
+    if ema20 > ema50 and adx >= adx_strong:
+        return "strong_uptrend"
 
-    eps_obv = abs(obv_slope) * eps_ratio
-    eps_ad  = abs(ad_slope) * eps_ratio
+    # === 温和上升趋势 ===
+    if ema20 > ema50 and adx >= adx_weak:
+        return "uptrend"
 
-    def trend(v, eps):
-        if v > eps:
-            return '↑'
-        elif v < -eps:
-            return '↓'
-        else:
-            return '→'
+    # === 趋势走弱 ===
+    if ema20 < ema50 and adx >= adx_weak:
+        return "downtrend"
 
-    obv_trend = trend(obv_slope, eps_obv)
-    ad_trend  = trend(ad_slope, eps_ad)
-
-    # ===== 强趋势 =====
-    if obv_trend == '↑' and ad_trend == '↑':
-        return "明确吸筹(最强)"
-    if obv_trend == '↓' and ad_trend == '↓':
-        return "趋势结束(最弱)"
-
-    # ===== 资金分歧 =====
-    if obv_trend == '↑' and ad_trend == '↓':
-        return "资金分歧(内强外弱)"
-    if obv_trend == '↓' and ad_trend == '↑':
-        return "价格拉升但量未确认"
-
-    # ===== 震荡 / 过渡 =====
-    if obv_trend == '↑' and ad_trend == '→':
-        return "洗盘(震荡)"
-    if obv_trend == '→' and ad_trend == '↓':
-        return "派发前兆(见顶)"
-    if obv_trend == '→' and ad_trend == '→':
-        return "量价均衡(整理期)"
-
-    return "未分类"
+    # === 无趋势 / 震荡 ===
+    return "sideways"
 
 
 # =========================
 # V3 新增：量价交易资格判定
 # =========================
+def obv_ad_trade_gate(
+    obv_ad_label,
+    trend_strength,
+    market_regime
+):
+    # 市场非多头，一律收缩
+    if market_regime != "多头":
+        return "回避"
 
-OBV_AD_BLOCKLIST = {
-    "趋势结束(最弱)",
-    "价格拉升但量未确认"
-}
+    # 强趋势 + 吸筹
+    if obv_ad_label == "明确吸筹" and trend_strength == "strong_uptrend":
+        return "允许建仓"
 
-OBV_AD_WATCHLIST = {
-    "资金分歧(内强外弱)"
-}
+    # 强趋势回撤（NVDA）
+    if obv_ad_label == "强趋势回撤" and trend_strength in ["strong_uptrend", "uptrend"]:
+        return "震荡允许建仓"
 
-def obv_ad_trade_gate(obv_ad_interpretation: str, vol20: float = None):
-    """
-    返回交易资格：
-    - allow_trade: bool
-    - trade_state: str
-    """
-    if obv_ad_interpretation in OBV_AD_BLOCKLIST:
-        return False, "禁止交易"
+    # 趋势中资金分歧
+    if obv_ad_label == "趋势中资金分歧":
+        return "小仓试探"
 
-    if obv_ad_interpretation in OBV_AD_WATCHLIST:
-        return True, "仅跟踪"
-    
-    # 低流动性直接禁止
-    if vol20 is not None and vol20 < 500000:          # ← 可根据偏好调整阈值
-        return False, "低流动性禁止"
+    # 底部试探
+    if obv_ad_label == "底部试探":
+        return "试仓观察"
 
-    return True, "允许建仓"
+    # 派发阶段
+    if obv_ad_label == "派发阶段":
+        return "禁止交易"
+
+    return "仅跟踪"
+
+# =========================
+# EMA：pandas 原生，稳定、可控
+# =========================
+def compute_ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+# =========================
+# ADX：用标准 Wilder 定义
+# =========================
+def compute_adx(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs()
+
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean()
+
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    adx = dx.rolling(period).mean()
+
+    return adx
+
+
+def compute_trend_strength_from_row(row, price_history_map):
+    code = row["stock_code"]
+    trade_date = row["trade_date"]
+
+    hist = price_history_map.get(code)
+    if hist is None:
+        return "unknown"
+
+    # 只取到当前行对应日期之前（防止未来数据）
+    hist = hist[hist["trade_date"] <= trade_date]
+
+    # 数据不足，直接放弃
+    if len(hist) < 50:
+        return "unknown"
+
+    ema20 = compute_ema(hist["close"], 20).iloc[-1]
+    ema50 = compute_ema(hist["close"], 50).iloc[-1]
+    adx14 = compute_adx(hist, 14).iloc[-1]
+
+    return classify_price_trend(
+        ema20,
+        ema50,
+        adx14
+    )
 
 
 # =========================
 # V3：准实盘综合评分模型
 # =========================
+# '明确吸筹', '强趋势回撤', '趋势中资金分歧', '控盘减弱预警', '底部试探', '派发阶段', '量价中性'
 OBV_SCORE_MAP = {
-    "明确吸筹(最强)": 1.0,
-    "洗盘(震荡)": 0.8,
-    "量价均衡(整理期)": 0.7,
-    "资金分歧(内强外弱)": 0.4,
-    "趋势结束(最弱)": 0.0,
-    "价格拉升但量未确认": 0.0
+    # === 主动进攻型 ===
+    "明确吸筹": 1.00,          # 最理想：趋势 + 资金 + 共振
+    # === 趋势中健康结构 ===
+    "强趋势回撤": 0.85,        # 上升趋势中的洗盘，极高价值
+    "底部试探": 0.75,          # 早期资金介入，允许小仓位
+    # === 中性 / 观察区 ===
+    "量价中性": 0.60,          # 盘整期，留在雷达内
+    "趋势中资金分歧": 0.50,    # 内外资分歧，需等待确认
+    # === 风险预警区 ===
+    "控盘减弱预警": 0.30,      # 不宜新开仓，防止诱多
+    # === 明确回避 ===
+    "派发阶段": 0.00           # 资金持续流出
+}
+
+TREND_STRENGTH_MULTIPLIER = {
+    "strong_uptrend": 1.10,
+    "uptrend":        1.00,
+    "sideways":       0.85,
+    "downtrend":      0.60,
+    "unknown":        0.80
 }
 
 
-def compute_trade_score(row, sector_dict):
+def compute_trade_score(row, sector_avg_rs: pd.DataFrame) -> float:
     """
-    准实盘评分：
+    V3：准实盘综合评分模型（含 trend_strength）
     - 技术结构权重 60%
     - CANSLIM 权重 40%
+    - trend_strength 作为执行环境调制因子（乘数）
     """
 
-    if not row['allow_trade']:
+    # === 硬性闸门 ===
+    if not row.get("allow_trade", False):
         return 0.0
 
-    obv_score = OBV_SCORE_MAP.get(row['obv_ad_interpretation'], 0.5)
-    rs_score = min(row.get('rs_rank', 50) / 100.0, 1.0)
-    canslim_score = min(row.get('canslim_score', 0) / 5.0, 1.0)
-    technical_score = (obv_score * 0.6 + rs_score * 0.4)
+    # === 技术结构 ===
+    obv_score = OBV_SCORE_MAP.get(
+        row.get("obv_ad_interpretation"), 0.5
+    )
+    rs_score = min(row.get("rs_rank", 50) / 100.0, 1.0)
+
+    technical_score = obv_score * 0.6 + rs_score * 0.4
+
+    # === 基本面 ===
+    canslim_score = min(row.get("canslim_score", 0) / 5.0, 1.0)
+
     base_score = technical_score * 0.6 + canslim_score * 0.4
 
-    # 计算行业加成
-    sector_rs = sector_dict.get(row['sector'], 50.0)
+    # === 趋势环境调制（核心新增） ===
+    trend_strength = row.get("trend_strength", "unknown")
+    trend_multiplier = TREND_STRENGTH_MULTIPLIER.get(
+        trend_strength, 0.8
+    )
+
+    base_score *= trend_multiplier
+
+    # === 行业加成 ===
+    sector_rs = sector_avg_rs.get(row.get("sector"), 50.0)
 
     if sector_rs > 75:
         sector_bonus = 0.12
@@ -1573,12 +1682,16 @@ def compute_trade_score(row, sector_dict):
         sector_bonus = 0.0
 
     final_score = base_score + sector_bonus
-    return round(max(0.0, min(final_score * 100, 100.0)), 2)
+
+    return round(
+        max(0.0, min(final_score * 100, 100.0)),
+        2
+    )
+
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "ORCL", "CDE"]
-# CURRENT_SELECTED_TICKERS = []
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "ORCL", "CDE", "BABA"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -1684,14 +1797,40 @@ def main():
     # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
     final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
 
+    for col in ["obv_slope_20", "obv_slope_5", "ad_slope_20", "ad_slope_5"]:
+        final_with_sim[col] = final_with_sim[col].fillna(0.0)
     # 量价趋势特征解读
     final_with_sim['obv_ad_interpretation'] = final_with_sim.apply(
         lambda row: classify_obv_ad_enhanced(
             row.get('obv_slope_20'),
             row.get('ad_slope_20'),
-            vol20=row.get('vol20'),
-            vix=current_vix if 'current_vix' in globals() else None
+            row.get('obv_slope_5'),
+            row.get('ad_slope_5'),
+            market_regime=market_regime if 'market_regime' in globals() else None
         ),
+        axis=1
+    )
+
+    # =========================
+    # 方向是否明确？
+    # EMA20 > EMA50 → 上行结构
+    # EMA20 < EMA50 → 下行结构
+    # 结构是否稳定?
+    # ADX 高 → 价格在“走趋势”
+    # ADX 低 → 价格在“来回震荡”
+    # 当前处在什么地形？
+    # trend_strength	地形隐喻	含义
+    # strong_uptrend	高速公路	可以执行几乎所有多头资金信号
+    # uptrend	        普通公路	可执行高质量资金信号
+    # sideways	        平地/沙地	只观察，不冲锋
+    # downtrend	        下坡路	    禁止做多
+    # =========================
+    price_history_map = {
+        code: g.sort_values("trade_date")
+        for code, g in final_with_sim.groupby("stock_code")
+    }
+    final_with_sim["trend_strength"] = final_with_sim.apply(
+        lambda row: compute_trend_strength_from_row(row, price_history_map),
         axis=1
     )
 
@@ -1699,7 +1838,7 @@ def main():
     # V3：应用量价交易 Gate
     # =========================
     gate_result = final_with_sim.apply(
-        lambda row: obv_ad_trade_gate(row['obv_ad_interpretation'], row.get('vol20')),
+        lambda row: obv_ad_trade_gate(row['obv_ad_interpretation'], row.get('trend_strength'), market_regime=market_regime if 'market_regime' in globals() else None),
         axis=1
     )
     final_with_sim['allow_trade'] = gate_result.apply(lambda x: x[0])
@@ -1712,7 +1851,7 @@ def main():
     sector_avg_rs = final_with_sim.groupby('sector')['rs_rank'].mean().to_dict()
     # 处理 None 或缺失的 sector（安全起见）
     sector_avg_rs[None] = 50.0        # 或更保守的值，如 40.0
-    # 使用 partial 固定 sector_dict 参数，生成一个只接受 row 的新函数
+    # 使用 partial 固定 sector_avg_rs 参数，生成一个只接受 row 的新函数
     final_with_sim['trade_score'] = final_with_sim.apply(
         lambda row: compute_trade_score(row, sector_avg_rs),
         axis=1
@@ -1738,8 +1877,8 @@ def main():
         "quarterly_eps_growth", "annual_eps_growth",
         "revenue_growth", "roe", "shares_outstanding", 
         "inst_ownership", "fcf_quality", "market_cap", 'sector', 
-        'trade_state', 'allow_trade', 'trade_score',
-        'obv_ad_interpretation', 'obv_slope_20', 'ad_slope_20'
+        'trade_state', 'trade_score', 'obv_ad_interpretation', 
+        'obv_slope_20', 'ad_slope_20'
     ]
     print(final_with_sim[display_cols].to_string(index=False))
 
