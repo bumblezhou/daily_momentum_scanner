@@ -11,13 +11,14 @@ import warnings
 import pytz
 from datetime import date, datetime, timedelta
 import pandas_market_calendars as mcal
+import threading
+import queue
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
 # ===================== 配置 =====================
 FINNHUB_TOKEN = "d40ckf9r01qqo3qha4bgd40ckf9r01qqo3qha4c0"
-
 DUCKDB_PATH = "stock_data.duckdb"
 
 PROXIES = {
@@ -27,7 +28,13 @@ PROXIES = {
 
 MAX_WORKERS = 8          # yfinance 并发线程
 YF_BATCH_SIZE = 20       # 每批 ticker 数
+INSERT_BATCH_SIZE = 100
+QUEUE_MAX_SIZE = 5000
 # ===============================================
+
+price_queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
+STOP_SIGNAL = object()
+
 
 yf.set_config(proxy="http://127.0.0.1:8118")
 
@@ -278,19 +285,20 @@ def get_tickers_missing_recent_data(trading_days):
 
 
 def mark_yf_unavailable(symbols):
-    if not symbols:
-        return
-
+    if not symbols: return
     con = duckdb.connect(DUCKDB_PATH)
-    con.executemany(
-        """
-        UPDATE stock_ticker
-        SET yf_price_available = FALSE
-        WHERE symbol = ?
-        """,
-        [(yahoo_to_finnhub(s),) for s in symbols]
-    )
-    con.close()
+    try:
+        # 直接拿 original_symbol 去匹配数据库 symbol 列
+        con.executemany(
+            "UPDATE stock_ticker SET yf_price_available = FALSE WHERE symbol = ?", 
+            [(s,) for s in symbols]
+        )
+        con.execute("COMMIT") 
+        print(f"🛠️ 数据库已更新：已永久屏蔽这 {len(symbols)} 只股票。")
+    except Exception as e:
+        print(f"❌ 数据库写入失败: {e}")
+    finally:
+        con.close()
 
 
 # symbol ↔ yahoo_symbol 映射函数
@@ -310,82 +318,136 @@ def yahoo_to_finnhub(symbol: str) -> str:
     return symbol.replace("-", ".")
 
 
-# 用 yfinance 批量补齐最近 10 个交易日行情（20 支一批）
+def duckdb_consumer():
+    con = duckdb.connect(DUCKDB_PATH)
+    buffer = []
+    SQL_INSERT = """
+    INSERT INTO stock_price (
+        stock_code,
+        trade_date,
+        open,
+        high,
+        low,
+        close,
+        volume
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (stock_code, trade_date) DO NOTHING
+    """
+    while True:
+        item = price_queue.get()
+
+        if item is STOP_SIGNAL:
+            break
+
+        buffer.append(item) # 逐行获取
+
+        if len(buffer) >= INSERT_BATCH_SIZE:
+            con.executemany(SQL_INSERT, buffer)
+            buffer.clear()
+
+    if buffer:
+        con.executemany(SQL_INSERT, buffer)
+
+    con.close()
+
+
 def update_recent_prices(watchlist: list = []):
     print(f"🕒 当前上海时间: {datetime.now():%Y-%m-%d %H:%M}")
-    
-    # 1. 自动根据 NYSE 日历获取最近 10 个有效交易日
-    # 这里面已经自动排除了周末、圣诞节、感恩节等
+
     trading_days = get_recent_trading_days_smart(10)
     print(f"📅 纽交所最近有效交易日：{trading_days}")
-    
+
     target_date = trading_days[-1]
     print(f"🎯 目标同步日期: {target_date}")
 
-    # 2. 检查数据库缺失
-    raw_tickers = get_tickers_missing_recent_data(trading_days)
-    if watchlist:
-        # 合并自选列表
-        raw_tickers = list(set(raw_tickers) | set(watchlist))
+    target_date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
+    stale_limit = target_date_obj - timedelta(days=7)
 
-    if not raw_tickers:
-        print(f"✅ 数据库已是最新（美东 {target_date} 已对齐），跳过更新")
+    raw_tickers = get_tickers_missing_recent_data(trading_days)
+    if not raw_tickers and not watchlist:
+        print(f"✅ 数据库已是最新，跳过更新")
         return
 
     yahoo_map = {t: finnhub_to_yahoo(t) for t in raw_tickers}
     yahoo_tickers = list(yahoo_map.values())
-
     print(f"需要更新 {len(yahoo_tickers)} 只股票")
+
+    # 🔥 核心改变：记录哪些真正写进了数据库
+    actual_success_yahoo_tickers = set()
+
+    consumer_thread = threading.Thread(target=duckdb_consumer, daemon=True)
+    consumer_thread.start()
 
     for i in range(0, len(yahoo_tickers), YF_BATCH_SIZE):
         batch = yahoo_tickers[i:i + YF_BATCH_SIZE]
         print(f"   更新 {i} - {i + len(batch)}")
 
-        failed = []
-
         try:
-            data = yf.download(
-                tickers=batch,
-                period="20d",
-                interval="1d",
-                group_by="ticker",
-                threads=False,
-                auto_adjust=True, # 复权价格
-                # proxy=PROXIES["http"]
-            )
+            data = yf.download(tickers=batch, period="20d", group_by='ticker', threads=True, auto_adjust=True)
 
-            save_price_to_duckdb(data)
-
-            # 🔍 判断哪些 ticker 没拿到数据
-            if isinstance(data.columns, pd.MultiIndex):
-                for yf_symbol in batch:
+            for yf_symbol in batch:
+                # 1. 提取 DataFrame
+                if len(batch) == 1:
+                    df = data
+                else:
                     if yf_symbol not in data.columns.levels[0]:
-                        failed.append(yf_symbol)
+                        print(f"   🔎 {yf_symbol}: yf 返回结果中完全不存在该列")
                         continue
-
                     df = data[yf_symbol]
 
-                    # 核心判断：Close 是否全部 NaN
-                    if df.empty or df["Close"].dropna().empty:
-                        failed.append(yf_symbol)
-            else:
-                # 单 ticker 情况
-                if data.empty or data["Close"].dropna().empty:
-                    failed.extend(batch)
+                # 2. 检查是否有数据
+                df_clean = df.dropna(subset=['Close'])
+                if df_clean.empty:
+                    print(f"   🔎 {yf_symbol}: Close 列全是空值 (NaN)")
+                    continue
 
+                # 3. 严格日期判定
+                last_val = df_clean.index.max()
+                last_dt = last_val.date() if hasattr(last_val, 'date') else last_val
+                
+                # --- 核心诊断打印 ---
+                # print(f"   🔎 {yf_symbol}: 最新日期={last_dt}, 目标日期={target_date_obj}")
+
+                if last_dt < target_date_obj: # 注意：直接对比目标同步日期
+                    print(f"   🔎 {yf_symbol}: 日期不合要求 ({last_dt} < {target_date_obj})，不计入成功")
+                    continue
+
+                # 4. 只有日期完全对上的，才算成功
+                actual_success_yahoo_tickers.add(yf_symbol)
+
+                # ✅ 只有通过了上面所有关卡，才认为成功，并入库
+                actual_success_yahoo_tickers.add(yf_symbol)
+
+                finnhub_symbol = yahoo_to_finnhub(yf_symbol)
+                for trade_date, row in df_clean.iterrows():
+                    price_queue.put((
+                        finnhub_symbol, trade_date.date(),
+                        float(row["Open"]), float(row["High"]), float(row["Low"]),
+                        float(row["Close"]), int(row["Volume"])
+                    ))
         except Exception as e:
-            print(f"❌ 批次失败: {batch}, {e}")
-            failed.extend(batch)
+            print(f"❌ 批次异常: {e}")
 
-        if failed:
-            # 反查原始 symbol
-            reverse_map = {v: k for k, v in yahoo_map.items()}
-            failed_symbols = [reverse_map[s] for s in failed if s in reverse_map]
+    price_queue.put(STOP_SIGNAL)
+    consumer_thread.join()
 
-            print(f"⚠️ 标记以下 ticker 为 yf 不可用: {failed_symbols}")
-            mark_yf_unavailable(failed_symbols)
-
-        time.sleep(1)
+    # ==========================================================
+    # 终极识别：总表 减去 真正入库成功的表 = 顽固失效的表
+    # ==========================================================
+    failed_tickers = list(set(yahoo_tickers) - actual_success_yahoo_tickers)
+    
+    if failed_tickers:
+        reverse_map = {v: k for k, v in yahoo_map.items()}
+        to_blacklist = [reverse_map[s] for s in failed_tickers if s in reverse_map]
+        
+        print(f"⚠️ 识别完成！以下 {len(to_blacklist)} 只股票因无数据或过期被判定为失效:")
+        print(f"🚫 列表: {to_blacklist}")
+        
+        # 执行标记入库
+        mark_yf_unavailable(to_blacklist)
+    else:
+        print("✅ 本次所有股票均已更新到最新日期。")
 
     print("🎉 全部完成")
 
@@ -393,291 +455,6 @@ def update_recent_prices(watchlist: list = []):
 # ============================================================
 # Stage 2：SwingTrend 技术筛选（全部在 DuckDB 内完成）
 # ============================================================
-
-def build_stage2_swingtrend_old(con, target_date: date, monitor_list: list = []) -> pd.DataFrame:
-    # 将列表转换为 SQL 字符串格式 ('AAPL', 'TSLA')
-    monitor_str = ", ".join([f"'{t}'" for t in monitor_list]) if monitor_list else "''"
-
-    sql = f"""
-    /* ======================================================
-       Stage 2 – SwingTrend 技术筛选
-       所有参数均可根据注释位置自行调整
-       ====================================================== */
-
-    WITH base AS (
-        SELECT
-            p.stock_code,
-            p.trade_date,
-            p.close,
-            p.high,
-            p.low,
-            p.volume,
-            t.sector,
-            /* ===== 均线参数（可调） ===== */
-            AVG(p.close) OVER w10  AS ma10,    -- 短线持仓用
-            AVG(p.close) OVER w20  AS ma20,    -- 新增：用于止损和VCP
-            AVG(p.close) OVER w50  AS ma50,
-            AVG(p.close) OVER w150 AS ma150,
-            AVG(p.close) OVER w200 AS ma200,
-            /* ===== 52 周高低点窗口（252 日） ===== */
-            MAX(p.high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
-            MIN(p.low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
-
-            COUNT(*) OVER w_all AS trading_days
-        FROM stock_price p
-        LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
-        WINDOW
-            w10  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 9 PRECEDING),
-            w20  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 19 PRECEDING),
-            w50  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 49 PRECEDING),
-            w150 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 149 PRECEDING),
-            w200 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 199 PRECEDING),
-            w252 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 251 PRECEDING),
-            w_all AS (PARTITION BY p.stock_code)
-    ),
-
-    /* ===== RS Rank 计算（Minervini 权重） ===== */
-    returns AS (
-        SELECT
-            stock_code,
-            trade_date,
-
-            /* 对上市不足一年的股票，自动使用可得周期并年化 */
-            POWER(
-                close / NULLIF(
-                    LAG(close, LEAST(trading_days - 1, 252))
-                    OVER (PARTITION BY stock_code ORDER BY trade_date),
-                0),
-                252.0 / NULLIF(LEAST(trading_days - 1, 252), 0)
-            ) - 1 AS r1y,
-
-            close / NULLIF(LAG(close,126) OVER w, close) - 1 AS r6m,
-            close / NULLIF(LAG(close,63)  OVER w, close) - 1 AS r3m,
-            close / NULLIF(LAG(close,21)  OVER w, close) - 1 AS r1m
-        FROM base
-        WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
-    ),
-
-    rs_scores AS (
-        SELECT
-            stock_code,
-            trade_date,
-
-            /* 🔥🔥 核心修正：使用 COALESCE 防止 NULL 传染
-               如果数据不足导致 r6m 为空，则视为 0，保证 rs_score 能算出来
-            */
-            (
-                0.4 * COALESCE(r1y, 0) + 
-                0.3 * COALESCE(r6m, 0) + 
-                0.2 * COALESCE(r3m, 0) + 
-                0.1 * COALESCE(r1m, 0)
-            ) AS rs_score,
-
-            /* 计算排名 */
-            PERCENT_RANK() OVER (
-                PARTITION BY trade_date
-                ORDER BY (
-                    0.4 * COALESCE(r1y, 0) + 
-                    0.3 * COALESCE(r6m, 0) + 
-                    0.2 * COALESCE(r3m, 0) + 
-                    0.1 * COALESCE(r1m, 0)
-                )
-            ) * 100 AS rs_rank
-        FROM returns
-    ),
-
-    rs_averages AS (  -- 新 CTE: 计算 rs_20 使用预计算的 rs_score（无嵌套）
-        SELECT
-            *,
-            /* 新增：RS 变化率 - 过去20日RS均值 */
-            AVG(rs_score) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS 19 PRECEDING
-            ) AS rs_20
-        FROM rs_scores
-    ),
-
-    rs_ranked AS (  -- 最终 CTE: 计算 lagged 值使用预计算的 rs_20（无嵌套）
-        SELECT
-            *,
-            /* 10日前 RS_20 */
-            LAG(rs_20, 10) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-            ) AS rs_20_10days_ago
-        FROM rs_averages
-    ),
-
-    /* ===== ATR（VCP 波动收缩） ===== */
-    atr_raw AS (
-        SELECT
-            stock_code,
-            trade_date,
-            GREATEST(
-                high - low,
-                ABS(high - LAG(close) OVER w),
-                ABS(low  - LAG(close) OVER w)
-            ) AS tr
-        FROM stock_price
-        WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
-    ),
-
-    atr_10day_avg AS (
-        SELECT
-            stock_code,
-            trade_date,
-            AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING) AS atr10_recent
-        FROM atr_raw
-    ),
-
-    atr_stats AS (
-        SELECT
-            a.stock_code,
-            a.trade_date,
-            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 4 PRECEDING)  AS atr5,
-            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 19 PRECEDING) AS atr20,
-            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 14 PRECEDING) AS atr15,
-            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 59 PRECEDING) AS atr60,
-            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 9 PRECEDING)  AS atr10,
-            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 49 PRECEDING) AS atr50,
-            (avg10.atr10_recent - LAG(avg10.atr10_recent, 10) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date)) / 10 AS atr_slope
-        FROM atr_raw a
-        JOIN atr_10day_avg avg10 USING (stock_code, trade_date)
-    ),
-
-    /* ===== Pivot（最近 40 日高点） ===== */
-    /* 修正点：重命名 CTE 为 pivot_data 避免关键字冲突 */
-    pivot_data AS (
-        SELECT
-            stock_code,
-            trade_date,
-            /* 修正点：取昨日起算的过去20日最高价，作为今天的压力位 */
-            MAX(high) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING
-            ) AS pivot_price
-        FROM stock_price
-    ),
-
-    /* ===== 成交量确认 ===== */
-    volume_check AS (
-        SELECT
-            stock_code,
-            trade_date,
-            volume,
-            AVG(volume) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS 19 PRECEDING  -- 修改为20日均量
-            ) AS vol20,
-            AVG(volume) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS 49 PRECEDING
-            ) AS vol50
-        FROM stock_price
-    ),
-
-    /* ===== 前5日最高价 ===== */
-    prev_high AS (
-        SELECT
-            stock_code,
-            trade_date,
-            MAX(high) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
-            ) AS high_5d
-        FROM stock_price
-    )
-
-    SELECT
-        b.stock_code,
-        b.trade_date,
-        b.close,
-        b.sector,
-        r.rs_rank,
-        b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
-        b.high_52w, b.low_52w,
-        a.atr5, a.atr20, a.atr15, a.atr60, a.atr10, a.atr50,
-        a.atr_slope,
-        r.rs_20, r.rs_20_10days_ago,
-        p.pivot_price,
-        v.volume, v.vol20, v.vol50,
-        ph.high_5d
-
-    FROM base b
-    JOIN rs_ranked r USING (stock_code, trade_date)
-    JOIN atr_stats a USING (stock_code, trade_date)
-    JOIN pivot_data p USING (stock_code, trade_date)
-    JOIN volume_check v USING (stock_code, trade_date)
-    JOIN prev_high ph USING (stock_code, trade_date)
-
-    WHERE
-        b.trade_date = DATE '{target_date}'
-        AND (
-            (
-                /* ===== 1. 基础结构：即使去掉了均线，也要保证不是垃圾股 ===== */
-                /* 均线排列参数标准：保守：close > ma50 > ma150 > ma200， 标准：close > ma150 AND ma50 > ma150 > ma200， 激进：close > ma50 AND ma50 > ma200 */
-                b.close > b.ma150
-                AND b.ma50  > b.ma150
-                AND b.ma150 > b.ma200
-                /* 距离 52 周低点：保守：close >= 1.5 * low_52w， 标准： close >= 1.25 * low_52w， 激进： close >= 1.15 * low_52w */
-                AND b.close >= 1.25 * b.low_52w   -- 距 52 周低点至少 +25%
-                AND b.close >= 0.75 * b.high_52w  -- 距 52 周高点不超过 -25%
-
-                /* 均线斜率参数标准：保守： ma150 > LAG(ma150, 20)， 标准： ma150 >= LAG(ma150, 20)， 激进： 不要求 */
-
-                /* ===== 2. RS 强度：保留，这是核心，但稍微放宽排名 ===== */
-                /* RS Rank（全市场）参数标准：保守：rs_rank >= 80，标准：rs_rank >= 70，激进：rs_rank >= 60，严禁低于 55（55 以下长期统计期望≈0）*/
-                AND ((r.rs_rank >= 75) OR (b.sector = 'Technology' AND r.rs_rank >= 65))  -- 保证强者恒强，允许科技、医疗、消费周期股稍微低一点
-                /* 注释掉苛刻的RS加速要求，允许RS走平。收紧到 0.95，不能明显走弱 */
-                /* RS 持续性参数标准： 保守：rs_20 > rs_20_10days_ago， 标准：rs_20 > rs_20_10days_ago * 0.95， 激进：不强制，但不允许明显下行 */
-                AND r.rs_20 > r.rs_20_10days_ago * 0.95
-
-                /* ===== 3. VCP 形态：放宽波动收缩阈值 ===== */
-                /* 将 0.8 放宽到 0.95，只要近期没有剧烈波动即可。 */
-                /* ATR 收缩强度参数标准： 保守：atr5 / atr20 < 0.85， 标准：atr5 / atr20 < 0.95， 激进：atr5 / atr20 < 1.0 */
-                AND (a.atr5 / NULLIF(a.atr20, 0)) < 0.95 
-                
-                /* 注释掉 slope < 0，有时候震荡期 slope 是平的 */
-                -- AND a.atr_slope < 0
-                
-                /* 保留：短期比长期稳定 */
-                /* 长短波动对比参数对比： 保守： atr5 < atr20 AND atr15 < atr60， 标准： atr15 < atr60， 激进： atr15 <= atr60 * 1.05 */
-                AND a.atr15 < a.atr60
-
-                /* ===== 4. 关键修改：移除“当天必须爆发”的条件 ===== */
-                /* 我们要找的是“准备好”的股票，而不是“已经涨完”的股票 */
-                /* AND (
-                    b.close > ph.high_5d
-                    OR b.close > p.pivot_price
-                )
-                AND v.volume >= 1.2 * v.vol20 
-                */
-                
-                /* 替代方案：只要成交量不要已经枯竭到死寂即可，或者完全不限 */
-                /* 成交量参数标准： 保守： vol20 > 1_000_000， 标准： vol20 > 300_000， 激进： vol20 > 150_000 */
-                AND v.vol20 > 500000
-
-                /* 市值参数标准： 保守： market_cap > 5e9， 标准： market_cap > 1e9， 激进： market_cap > 不强制 */
-                AND EXISTS (
-                    SELECT 1 FROM stock_fundamentals f
-                    WHERE f.stock_code = b.stock_code AND f.market_cap >= 1e9
-                )
-            )
-            OR
-            b.stock_code IN ({monitor_str})
-        )
-
-    """
-
-    df = con.execute(sql).df()
-    return df
-
-
 def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], market_regime: str = "多头") -> pd.DataFrame:
     if market_regime == "多头":
         market_filter_sql = """
@@ -699,8 +476,8 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
                 /* ===== 2. 52 周结构（放宽） =====
                 允许更早期的 Stage 2
                 */
-                AND b.close >= 1.15 * b.low_52w     -- 距 52 周低点 ≥ +15%
-                AND b.close >= 0.70 * b.high_52w    -- 距 52 周高点 ≥ -30%
+                AND b.close >= 1.25 * b.low_52w     -- 距 52 周低点 ≥ +25%
+                AND b.close >= 0.55 * b.high_52w    -- 距 52 周高点 ≥ -45%
 
                 /* ===== 3. RS 强度（收紧） =====
                 多头市中，强者更强是核心假设
@@ -1015,6 +792,269 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
 
     """
 
+    df = con.execute(sql).df()
+    return df
+
+
+def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], market_regime: str = "多头"):
+    """
+    平衡版：介于标准版和应急版之间
+    
+    核心改动：
+    1. 均线排列：close > ma50 AND ma50 > ma200（移除ma150要求）
+    2. 52周位置：close >= 1.25 * low_52w AND >= 0.55 * high_52w
+    3. RS排名：≥65（前35%）
+    4. VCP收缩：atr5/atr20 < 1.10（略微放宽）
+    5. 成交量：10万股
+    
+    预期筛选：50-150支股票
+    """
+    
+    monitor_str = ", ".join([f"'{t}'" for t in monitor_list]) if monitor_list else "''"
+    
+    if market_regime == "多头":
+        market_filter_sql = """
+            (
+                /* ===== 1. 均线排列（简化版）===== */
+                b.close > b.ma50
+                AND b.ma50 > b.ma200
+                AND b.ma50 IS NOT NULL
+                AND b.ma200 IS NOT NULL
+                
+                /* ===== 2. 52周位置（适中）===== */
+                AND b.close >= 1.25 * b.low_52w     -- 距52周低点 ≥ +25%
+                AND b.close >= 0.55 * b.high_52w    -- 距52周高点 ≥ -45%
+                
+                /* ===== 3. RS强度（适中）===== */
+                AND r.rs_rank >= 65  -- 前35%
+                AND r.rs_20 >= r.rs_20_10days_ago * 0.88  -- RS不能明显走弱
+                
+                /* ===== 4. VCP收缩（略微放宽）===== */
+                AND (a.atr5 / NULLIF(a.atr20, 0)) < 1.10
+                AND a.atr15 <= a.atr60 * 1.05
+                
+                /* ===== 5. 成交量（标准）===== */
+                AND v.vol20 > 100000
+            )
+        """
+    else:
+        # 非多头市场保持严格
+        market_filter_sql = """
+            (
+                b.close > b.ma150
+                AND b.ma50 > b.ma150
+                AND b.ma150 > b.ma200
+                AND b.close >= 1.30 * b.low_52w
+                AND b.close >= 0.80 * b.high_52w
+                AND r.rs_rank >= 70
+                AND r.rs_20 > r.rs_20_10days_ago
+                AND (a.atr5 / NULLIF(a.atr20, 0)) < 0.95
+                AND a.atr15 < a.atr60
+                AND v.vol20 > 300000
+            )
+        """
+    
+    # SQL主体（与标准版相同，只替换market_filter_sql）
+    sql = f"""
+    WITH base AS (
+        SELECT
+            p.stock_code,
+            p.trade_date,
+            p.close,
+            p.high,
+            p.low,
+            p.volume,
+            t.sector,
+            AVG(p.close) OVER w10  AS ma10,
+            AVG(p.close) OVER w20  AS ma20,
+            AVG(p.close) OVER w50  AS ma50,
+            AVG(p.close) OVER w150 AS ma150,
+            AVG(p.close) OVER w200 AS ma200,
+            MAX(p.high) OVER w252 AS high_52w,
+            MIN(p.low) OVER w252 AS low_52w,
+            COUNT(*) OVER w_all AS trading_days
+        FROM stock_price p
+        LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
+        WINDOW
+            w10  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 9 PRECEDING),
+            w20  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 19 PRECEDING),
+            w50  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 49 PRECEDING),
+            w150 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 149 PRECEDING),
+            w200 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 199 PRECEDING),
+            w252 AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 251 PRECEDING),
+            w_all AS (PARTITION BY p.stock_code)
+    ),
+
+    returns AS (
+        SELECT
+            stock_code,
+            trade_date,
+            POWER(
+                close / NULLIF(
+                    LAG(close, LEAST(trading_days - 1, 252))
+                    OVER (PARTITION BY stock_code ORDER BY trade_date),
+                0),
+                252.0 / NULLIF(LEAST(trading_days - 1, 252), 0)
+            ) - 1 AS r1y,
+            close / NULLIF(LAG(close,126) OVER w, close) - 1 AS r6m,
+            close / NULLIF(LAG(close,63)  OVER w, close) - 1 AS r3m,
+            close / NULLIF(LAG(close,21)  OVER w, close) - 1 AS r1m
+        FROM base
+        WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
+    ),
+
+    rs_scores AS (
+        SELECT
+            stock_code,
+            trade_date,
+            (
+                0.4 * COALESCE(r1y, 0) + 
+                0.3 * COALESCE(r6m, 0) + 
+                0.2 * COALESCE(r3m, 0) + 
+                0.1 * COALESCE(r1m, 0)
+            ) AS rs_score,
+            PERCENT_RANK() OVER (
+                PARTITION BY trade_date
+                ORDER BY (
+                    0.4 * COALESCE(r1y, 0) + 
+                    0.3 * COALESCE(r6m, 0) + 
+                    0.2 * COALESCE(r3m, 0) + 
+                    0.1 * COALESCE(r1m, 0)
+                )
+            ) * 100 AS rs_rank
+        FROM returns
+    ),
+
+    rs_averages AS (
+        SELECT
+            *,
+            AVG(rs_score) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS 19 PRECEDING
+            ) AS rs_20
+        FROM rs_scores
+    ),
+
+    rs_ranked AS (
+        SELECT
+            *,
+            LAG(rs_20, 10) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+            ) AS rs_20_10days_ago
+        FROM rs_averages
+    ),
+
+    atr_raw AS (
+        SELECT
+            stock_code,
+            trade_date,
+            GREATEST(
+                high - low,
+                ABS(high - LAG(close) OVER w),
+                ABS(low  - LAG(close) OVER w)
+            ) AS tr
+        FROM stock_price
+        WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
+    ),
+
+    atr_10day_avg AS (
+        SELECT
+            stock_code,
+            trade_date,
+            AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 9 PRECEDING) AS atr10_recent
+        FROM atr_raw
+    ),
+
+    atr_stats AS (
+        SELECT
+            a.stock_code,
+            a.trade_date,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 4 PRECEDING)  AS atr5,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 19 PRECEDING) AS atr20,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 14 PRECEDING) AS atr15,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 59 PRECEDING) AS atr60,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 9 PRECEDING)  AS atr10,
+            AVG(tr) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date ROWS 49 PRECEDING) AS atr50,
+            (avg10.atr10_recent - LAG(avg10.atr10_recent, 10) OVER (PARTITION BY a.stock_code ORDER BY a.trade_date)) / 10 AS atr_slope
+        FROM atr_raw a
+        JOIN atr_10day_avg avg10 USING (stock_code, trade_date)
+    ),
+
+    pivot_data AS (
+        SELECT
+            stock_code,
+            trade_date,
+            MAX(high) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS BETWEEN 40 PRECEDING AND 1 PRECEDING
+            ) AS pivot_price
+        FROM stock_price
+    ),
+
+    volume_check AS (
+        SELECT
+            stock_code,
+            trade_date,
+            volume,
+            AVG(volume) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS 19 PRECEDING
+            ) AS vol20,
+            AVG(volume) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS 49 PRECEDING
+            ) AS vol50
+        FROM stock_price
+    ),
+
+    prev_high AS (
+        SELECT
+            stock_code,
+            trade_date,
+            MAX(high) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
+            ) AS high_5d
+        FROM stock_price
+    )
+
+    SELECT
+        b.stock_code,
+        b.trade_date,
+        b.close,
+        b.sector,
+        r.rs_rank,
+        b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
+        b.high_52w, b.low_52w,
+        a.atr5, a.atr20, a.atr15, a.atr60, a.atr10, a.atr50,
+        a.atr_slope,
+        r.rs_20, r.rs_20_10days_ago,
+        p.pivot_price,
+        v.volume, v.vol20, v.vol50,
+        ph.high_5d
+
+    FROM base b
+    JOIN rs_ranked r USING (stock_code, trade_date)
+    JOIN atr_stats a USING (stock_code, trade_date)
+    JOIN pivot_data p USING (stock_code, trade_date)
+    JOIN volume_check v USING (stock_code, trade_date)
+    JOIN prev_high ph USING (stock_code, trade_date)
+
+    WHERE
+        b.trade_date = DATE '{target_date}'
+        AND (
+            {market_filter_sql}
+            OR
+            b.stock_code IN ({monitor_str})
+        )
+    """
+    
     df = con.execute(sql).df()
     return df
 
@@ -1512,38 +1552,35 @@ def classify_price_trend(
 
 
 # =========================
-# V3 新增：量价交易资格判定
+# V3 修正版：量价交易资格判定（返回二元组）
 # =========================
-def obv_ad_trade_gate(
-    obv_ad_label,
-    trend_strength,
-    market_regime
-):
-    # 市场非多头，一律收缩
-    if market_regime != "多头":
-        return "回避"
+def obv_ad_trade_gate(obv_ad_label, trend_strength):
+    # 允许交易的趋势集合
+    tradable_trends = {
+        "strong_uptrend",
+        "uptrend",
+        "trend_pullback"
+    }
 
-    # 强趋势 + 吸筹
-    if obv_ad_label == "明确吸筹" and trend_strength == "strong_uptrend":
-        return "允许建仓"
-
-    # 强趋势回撤（NVDA）
-    if obv_ad_label == "强趋势回撤" and trend_strength in ["strong_uptrend", "uptrend"]:
-        return "震荡允许建仓"
-
-    # 趋势中资金分歧
-    if obv_ad_label == "趋势中资金分歧":
-        return "小仓试探"
-
-    # 底部试探
-    if obv_ad_label == "底部试探":
-        return "试仓观察"
-
-    # 派发阶段
+    # 明确禁止
     if obv_ad_label == "派发阶段":
-        return "禁止交易"
+        return False, "禁止交易"
 
-    return "仅跟踪"
+    if trend_strength not in tradable_trends:
+        return False, "仅跟踪"
+
+    # === 趋势 + 量价组合 ===
+    if obv_ad_label == "明确吸筹":
+        return True, "允许建仓"
+
+    if obv_ad_label == "强趋势回撤":
+        return True, "回撤建仓"
+
+    if obv_ad_label == "趋势中资金分歧":
+        return True, "小仓试探"
+
+    return False, "仅跟踪"
+
 
 # =========================
 # EMA：pandas 原生，稳定、可控
@@ -1582,30 +1619,92 @@ def compute_adx(df, period=14):
     return adx
 
 
-def compute_trend_strength_from_row(row, price_history_map):
-    code = row["stock_code"]
-    trade_date = row["trade_date"]
+def compute_trend_strength_from_row(
+    row,
+    price_history_map: dict,
+    min_bars: int = 60
+) -> str:
+    """
+    实盘级趋势强度判定（稳健 / 非未来函数）
+    返回枚举：
+    - strong_uptrend
+    - uptrend
+    - trend_pullback
+    - range
+    - downtrend
+    - unknown
+    """
 
+    code = row.get("stock_code")
     hist = price_history_map.get(code)
-    if hist is None:
+
+    if hist is None or len(hist) < min_bars:
         return "unknown"
 
-    # 只取到当前行对应日期之前（防止未来数据）
-    hist = hist[hist["trade_date"] <= trade_date]
+    # === 取最近数据 ===
+    h = hist.tail(120).copy()
 
-    # 数据不足，直接放弃
-    if len(hist) < 50:
-        return "unknown"
+    close = h["close"]
+    ma20 = close.rolling(20).mean()
+    ma50 = close.rolling(50).mean()
+    ma200 = close.rolling(200).mean()
 
-    ema20 = compute_ema(hist["close"], 20).iloc[-1]
-    ema50 = compute_ema(hist["close"], 50).iloc[-1]
-    adx14 = compute_adx(hist, 14).iloc[-1]
+    last_close = close.iloc[-1]
+    last_ma20 = ma20.iloc[-1]
+    last_ma50 = ma50.iloc[-1]
+    last_ma200 = ma200.iloc[-1] if len(ma200.dropna()) > 0 else None
 
-    return classify_price_trend(
-        ema20,
-        ema50,
-        adx14
-    )
+    # === 均线斜率（避免用 pct_change 过激） ===
+    ma20_slope = (ma20.iloc[-1] - ma20.iloc[-6]) / ma20.iloc[-6]
+    ma50_slope = (ma50.iloc[-1] - ma50.iloc[-11]) / ma50.iloc[-11]
+
+    # === 回撤幅度 ===
+    recent_high = close.tail(30).max()
+    pullback_pct = (recent_high - last_close) / recent_high
+
+    # ==========================================================
+    # 1️⃣ 强上升趋势
+    # ==========================================================
+    if (
+        last_close > last_ma20 > last_ma50
+        and (last_ma200 is None or last_ma50 > last_ma200)
+        and ma20_slope > 0.01
+        and ma50_slope > 0.005
+    ):
+        return "strong_uptrend"
+
+    # ==========================================================
+    # 2️⃣ 趋势中健康回撤（⭐核心交易区）
+    # ==========================================================
+    if (
+        last_ma20 >= last_ma50
+        and ma50_slope > 0
+        and 0.03 <= pullback_pct <= 0.18
+    ):
+        return "trend_pullback"
+
+    # ==========================================================
+    # 3️⃣ 普通上升趋势
+    # ==========================================================
+    if (
+        last_close > last_ma50
+        and ma50_slope > 0
+    ):
+        return "uptrend"
+
+    # ==========================================================
+    # 4️⃣ 明确下行
+    # ==========================================================
+    if (
+        last_close < last_ma50
+        and ma50_slope < 0
+    ):
+        return "downtrend"
+
+    # ==========================================================
+    # 5️⃣ 震荡区间
+    # ==========================================================
+    return "range"
 
 
 # =========================
@@ -1628,11 +1727,12 @@ OBV_SCORE_MAP = {
 }
 
 TREND_STRENGTH_MULTIPLIER = {
-    "strong_uptrend": 1.10,
-    "uptrend":        1.00,
-    "sideways":       0.85,
-    "downtrend":      0.60,
-    "unknown":        0.80
+    "strong_uptrend": 1.15,
+    "uptrend": 1.05,
+    "trend_pullback": 1.10,
+    "range": 0.85,
+    "downtrend": 0.70,
+    "unknown": 0.80,
 }
 
 
@@ -1689,6 +1789,408 @@ def compute_trade_score(row, sector_avg_rs: pd.DataFrame) -> float:
     )
 
 
+def check_data_integrity(con):
+    """
+    检查数据库数据完整性
+    """
+    print("\n" + "="*80)
+    print("🔍 数据完整性检查")
+    print("="*80)
+    
+    # 1. 检查ticker表
+    ticker_count = con.execute("""
+        SELECT COUNT(*) FROM stock_ticker
+        WHERE type = 'Common Stock'
+        AND mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+    """).fetchone()[0]
+    print(f"\n📋 Ticker表中的普通股数量: {ticker_count}")
+    
+    # 2. 检查价格表
+    latest_date = con.execute("SELECT MAX(trade_date) FROM stock_price").fetchone()[0]
+    print(f"📅 价格表最新日期: {latest_date}")
+    
+    latest_price_count = con.execute(f"""
+        SELECT COUNT(DISTINCT stock_code)
+        FROM stock_price
+        WHERE trade_date = DATE '{latest_date}'
+    """).fetchone()[0]
+    print(f"📊 最新日期有价格的股票数: {latest_price_count}")
+    
+    # 3. 检查各交易所分布
+    exchange_dist = con.execute(f"""
+        SELECT t.mic, COUNT(DISTINCT p.stock_code) as cnt
+        FROM stock_price p
+        INNER JOIN stock_ticker t ON p.stock_code = t.symbol
+        WHERE p.trade_date = DATE '{latest_date}'
+        AND t.type = 'Common Stock'
+        GROUP BY t.mic
+        ORDER BY cnt DESC
+    """).fetchdf()
+    
+    if not exchange_dist.empty:
+        print(f"\n📈 各交易所分布:")
+        for _, row in exchange_dist.iterrows():
+            print(f"   {row['mic']}: {row['cnt']} 支")
+    
+    # 4. 检查yf_price_available标记
+    unavailable_count = con.execute("""
+        SELECT COUNT(*)
+        FROM stock_ticker
+        WHERE type = 'Common Stock'
+        AND mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+        AND yf_price_available = FALSE
+    """).fetchone()[0]
+    print(f"\n⚠️  被标记为yf不可用的股票: {unavailable_count}")
+    
+    # 5. 检查基本面数据
+    fundamental_count = con.execute("SELECT COUNT(*) FROM stock_fundamentals").fetchone()[0]
+    print(f"📊 有基本面数据的股票: {fundamental_count}")
+    
+    # 6. 推断问题
+    print("\n" + "="*80)
+    print("🔍 诊断结果:")
+    print("="*80)
+    
+    if ticker_count > 1000 and latest_price_count < 100:
+        print("❌ 严重问题：Ticker表有大量股票，但价格数据极少！")
+        print("   可能原因：")
+        print("   1. fetch_all_prices() 从未完整运行过")
+        print("   2. yf_price_available 被错误标记")
+        print("   3. 数据下载被中断")
+        print("\n💡 建议：")
+        print("   - 运行 fetch_all_prices() 进行全量下载")
+        print("   - 或者重置 yf_price_available 标记")
+    elif latest_price_count < 50:
+        print("⚠️  警告：可用股票数量过少，无法进行有效筛选")
+        print(f"   当前只有 {latest_price_count} 支股票有数据")
+    else:
+        print(f"✅ 数据看起来正常，有 {latest_price_count} 支股票可供筛选")
+    
+    print("="*80 + "\n")
+    
+    return latest_price_count
+
+
+def diagnose_stage2_filters(con, target_date):
+    """
+    修复后的诊断函数 - 使用正确的f-string格式化
+    """
+    
+    print("\n" + "="*80)
+    print("🔍 Stage2 筛选条件诊断报告")
+    print("="*80)
+    
+    # 🔥 修复：使用f-string格式化所有SQL
+    total_sql = f"""
+        SELECT COUNT(DISTINCT p.stock_code) as cnt
+        FROM stock_price p
+        LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
+        WHERE
+            p.trade_date = DATE '{target_date}'
+            AND t.type = 'Common Stock'
+            AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+            AND COALESCE(t.yf_price_available, TRUE) = TRUE
+    """
+    total = con.execute(total_sql).fetchone()[0]
+    print(f"\n📊 基准：有最新价格数据的股票总数 = {total}")
+    
+    if total == 0:
+        print("\n❌ 错误：没有找到任何符合条件的股票！")
+        print("   请先运行数据完整性检查")
+        return
+    
+    # 测试各个条件
+    conditions = [
+        ("均线排列: close > ma50 > ma200", f"""
+            WITH base AS (
+                SELECT
+                    p.stock_code,
+                    p.trade_date,
+                    p.close,
+                    AVG(p.close) OVER (
+                        PARTITION BY p.stock_code
+                        ORDER BY p.trade_date
+                        ROWS BETWEEN 49 PRECEDING AND CURRENT ROW
+                    ) AS ma50,
+                    AVG(p.close) OVER (
+                        PARTITION BY p.stock_code
+                        ORDER BY p.trade_date
+                        ROWS BETWEEN 199 PRECEDING AND CURRENT ROW
+                    ) AS ma200
+                FROM stock_price p
+                JOIN stock_ticker t ON p.stock_code = t.symbol
+                WHERE
+                    t.type = 'Common Stock'
+                    AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+                    AND COALESCE(t.yf_price_available, TRUE) = TRUE
+            )
+            SELECT COUNT(*)
+            FROM base
+            WHERE
+                trade_date = DATE '{target_date}'
+                AND close > ma50
+                AND ma50 > ma200;
+        """),
+        
+        ("52周位置: ≥1.25*low_52w AND ≥0.55*high_52w", f"""
+            WITH base AS (
+                SELECT
+                    p.stock_code,
+                    p.close,
+                    MAX(p.high) OVER (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 251 PRECEDING) AS high_52w,
+                    MIN(p.low) OVER (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 251 PRECEDING) AS low_52w
+                FROM stock_price p
+                LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
+                WHERE
+                    p.trade_date = DATE '{target_date}'
+                    AND t.type = 'Common Stock'
+                    AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+                    AND COALESCE(t.yf_price_available, TRUE) = TRUE
+            )
+            SELECT COUNT(*) FROM base
+            WHERE close >= 1.25 * low_52w AND close >= 0.55 * high_52w
+        """),
+        
+        ("RS排名: ≥65", f"""
+            WITH base AS (
+                SELECT
+                    p.stock_code,
+                    p.trade_date,
+                    p.close,
+                    COUNT(*) OVER w_all AS trading_days
+                FROM stock_price p
+                LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
+                WHERE
+                    t.type = 'Common Stock'
+                    AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+                    AND COALESCE(t.yf_price_available, TRUE) = TRUE
+                WINDOW w_all AS (PARTITION BY p.stock_code)
+            ),
+            returns AS (
+                SELECT
+                    stock_code,
+                    trade_date,
+                    POWER(
+                        close / NULLIF(
+                            LAG(close, LEAST(trading_days - 1, 252))
+                            OVER (PARTITION BY stock_code ORDER BY trade_date),
+                        0),
+                        252.0 / NULLIF(LEAST(trading_days - 1, 252), 0)
+                    ) - 1 AS r1y,
+                    close / NULLIF(LAG(close,126) OVER w, close) - 1 AS r6m,
+                    close / NULLIF(LAG(close,63)  OVER w, close) - 1 AS r3m,
+                    close / NULLIF(LAG(close,21)  OVER w, close) - 1 AS r1m
+                FROM base
+                WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
+            ),
+            rs_scores AS (
+                SELECT
+                    stock_code,
+                    trade_date,
+                    PERCENT_RANK() OVER (
+                        PARTITION BY trade_date
+                        ORDER BY (
+                            0.4 * COALESCE(r1y, 0) + 
+                            0.3 * COALESCE(r6m, 0) + 
+                            0.2 * COALESCE(r3m, 0) + 
+                            0.1 * COALESCE(r1m, 0)
+                        )
+                    ) * 100 AS rs_rank
+                FROM returns
+            )
+            SELECT COUNT(*) FROM rs_scores
+            WHERE trade_date = DATE '{target_date}' AND rs_rank >= 65
+        """),
+        
+        ("成交量: 20日均量 > 10万股", f"""
+            WITH vol AS (
+                SELECT
+                    p.stock_code,
+                    AVG(p.volume) OVER (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 19 PRECEDING) AS vol20
+                FROM stock_price p
+                LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
+                WHERE
+                    p.trade_date = DATE '{target_date}'
+                    AND t.type = 'Common Stock'
+                    AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+                    AND COALESCE(t.yf_price_available, TRUE) = TRUE
+            )
+            SELECT COUNT(*) FROM vol WHERE vol20 > 100000
+        """),
+        
+        ("基本面数据存在 + 市值≥10亿", """
+            SELECT COUNT(DISTINCT f.stock_code)
+            FROM stock_fundamentals f
+            INNER JOIN stock_ticker t ON f.stock_code = t.symbol
+            WHERE
+                t.type = 'Common Stock'
+                AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+                AND f.market_cap >= 1e9
+        """),
+        
+        ("ATR波动收缩: atr5/atr20 < 1.05", f"""
+            WITH atr_raw AS (
+                SELECT
+                    stock_code,
+                    trade_date,
+                    GREATEST(
+                        high - low,
+                        ABS(high - LAG(close) OVER w),
+                        ABS(low  - LAG(close) OVER w)
+                    ) AS tr
+                FROM stock_price
+                WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
+            ),
+            atr_stats AS (
+                SELECT
+                    stock_code,
+                    trade_date,
+                    AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 4 PRECEDING) AS atr5,
+                    AVG(tr) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING) AS atr20
+                FROM atr_raw
+            )
+            SELECT COUNT(*)
+            FROM atr_stats a
+            LEFT JOIN stock_ticker t ON a.stock_code = t.symbol
+            WHERE
+                a.trade_date = DATE '{target_date}'
+                AND t.type = 'Common Stock'
+                AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+                AND (a.atr5 / NULLIF(a.atr20, 0)) < 1.05
+        """)
+    ]
+    
+    print("\n" + "-"*80)
+    print("逐项筛选结果：")
+    print("-"*80)
+    
+    for name, sql in conditions:
+        try:
+            count = con.execute(sql).fetchone()[0]
+            pass_rate = (count / total * 100) if total > 0 else 0
+            
+            # 🎨 彩色输出
+            if pass_rate > 20:
+                status = "✅"
+            elif pass_rate > 10:
+                status = "⚠️ "
+            else:
+                status = "❌"
+            
+            print(f"\n{status} {name}")
+            print(f"  通过数量: {count:>6} / {total}  ({pass_rate:>5.1f}%)")
+            print(f"  被过滤: {total - count:>6} 支")
+        except Exception as e:
+            print(f"\n✗ {name}")
+            print(f"  错误: {str(e)[:100]}")
+    
+    print("\n" + "="*80)
+    print("💡 建议：")
+    print("-"*80)
+    print("1. 如果某个条件通过率 < 10%，考虑放宽该条件")
+    print("2. 如果'基本面数据存在'通过率很低，需要先运行 update_fundamentals()")
+    print("3. 多头市场建议通过率在 5-15% 之间（即筛选出50-200支股票）")
+    print("="*80 + "\n")
+
+
+def reset_yf_availability(con):
+    """
+    重置所有股票的yf_price_available标记
+    用于修复被错误标记的股票
+    """
+    print("\n🔄 重置yf_price_available标记...")
+    
+    # 先备份当前标记
+    before = con.execute("""
+        SELECT COUNT(*) FROM stock_ticker WHERE yf_price_available = FALSE
+    """).fetchone()[0]
+    
+    # 重置所有标记
+    con.execute("""
+        UPDATE stock_ticker
+        SET yf_price_available = TRUE
+        WHERE type = 'Common Stock'
+        AND mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+    """)
+    
+    print(f"✅ 已重置 {before} 个标记")
+    print("   现在可以重新运行 fetch_all_prices() 或 update_recent_prices()")
+
+
+def load_all_price_data(
+    con=None,
+    min_date: str | None = None
+) -> pd.DataFrame:
+    """
+    实盘级行情入口
+    - 只做一件事：加载所有可用价格数据
+    - 不筛选、不判断、不加工
+    """
+
+    where_clause = ""
+    if min_date:
+        where_clause = f"WHERE trade_date >= '{min_date}'"
+
+    sql = f"""
+    SELECT
+        stock_code,
+        trade_date,
+        open,
+        high,
+        low,
+        close,
+        volume
+    FROM stock_price
+    {where_clause}
+    ORDER BY stock_code, trade_date
+    """
+
+    df = con.execute(sql).fetch_df()
+
+    # ====== 基本防御 ======
+    if df.empty:
+        raise RuntimeError("❌ load_all_price_data: 价格表为空")
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+
+    return df
+
+
+def build_price_history_map(
+    con,
+    min_bars: int = 60
+) -> dict:
+    """
+    构建股票 → 历史行情映射（实盘安全）
+    """
+    price_df = load_all_price_data(con)
+
+    required_cols = {"stock_code", "trade_date", "close"}
+
+    if not required_cols.issubset(price_df.columns):
+        raise ValueError(f"price_df 缺少必要字段: {required_cols}")
+
+    price_df = (
+        price_df
+        .sort_values(["stock_code", "trade_date"])
+        .copy()
+    )
+
+    price_history_map = {}
+
+    for code, g in price_df.groupby("stock_code"):
+        if len(g) >= min_bars:
+            price_history_map[code] = g.reset_index(drop=True)
+
+    print(
+        f"📦 price_history_map 构建完成："
+        f"{len(price_history_map)} / "
+        f"{price_df['stock_code'].nunique()} 只股票"
+    )
+
+    return price_history_map
+
+
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
 CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "ORCL", "CDE", "BABA"]
@@ -1713,6 +2215,37 @@ def main():
     # 连接数据库
     con = duckdb.connect(DUCKDB_PATH)
 
+    # 构建价格历史映射
+    price_history_map = build_price_history_map(
+        con=con,
+        min_bars=60
+    )
+
+    # 🔥 新增：先检查数据完整性
+    stock_count = check_data_integrity(con)
+    
+    # 如果数据严重不足，给出警告和选项
+    if stock_count < 100:
+        print("\n" + "="*80)
+        print("⚠️  警告：数据库中股票数量严重不足！")
+        print("="*80)
+        print("\n请选择以下操作之一：")
+        print("1. 全量下载所有股票价格（首次运行，耗时较长）")
+        print("2. 重置yf标记后增量更新")
+        print("3. 忽略警告继续运行（仅用于测试）")
+        print("\n如需执行操作1或2，请在代码中取消相应注释")
+        print("="*80 + "\n")
+        
+        # 🔥 选项1：全量下载（取消下面注释）
+        # fetch_all_prices()
+        
+        # 🔥 选项2：重置标记（取消下面注释）
+        # reset_yf_availability(con)
+        # update_recent_prices([])  # 空列表=更新所有缺失的
+        
+        # 🔥 选项3：继续运行（默认）
+        print("⏭️  继续使用现有数据运行...")
+
     # 先更新所有基本面数据（包含监控名单）
     update_fundamentals(con, get_tickers_missing_recent_data(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=True)
 
@@ -1729,9 +2262,14 @@ def main():
     market_regime = "多头" if regime.get("is_bull", False) else "非多头"
     print(f"市场形态判定: {market_regime}")
 
+    # 🔥 新增：运行诊断
+    diagnose_stage2_filters(con, latest_date_in_db)
+
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
     stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    # stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    
     print(f"Stage 2 股票数量: {len(stage2)}")
     
     # 更新量价趋势特征表
@@ -1764,7 +2302,7 @@ def main():
     # 暂时降低过滤门槛以确保有输出
     final_filtered = (
         final
-        .query("canslim_score > 0")
+        .query("canslim_score > 0 and market_cap >= 1_000_000_000 and quarterly_eps_growth.notna()")
         .sort_values(["canslim_score", "rs_rank", "is_current_hold"], ascending=False)
     )
 
@@ -1825,22 +2363,31 @@ def main():
     # sideways	        平地/沙地	只观察，不冲锋
     # downtrend	        下坡路	    禁止做多
     # =========================
-    price_history_map = {
-        code: g.sort_values("trade_date")
-        for code, g in final_with_sim.groupby("stock_code")
-    }
     final_with_sim["trend_strength"] = final_with_sim.apply(
         lambda row: compute_trend_strength_from_row(row, price_history_map),
         axis=1
     )
 
+    # print("\n================ trend_strength 唯一取值全集 ================")
+    # print(
+    #     final_with_sim["trend_strength"]
+    #     .value_counts(dropna=False)
+    # )
+    # print("==============================================================")
+    # print("\n🔍 trend_strength 样本（前 10 条）")
+    # print(
+    #     final_with_sim[["stock_code", "trend_strength"]]
+    #     .head(10)
+    # )
+
     # =========================
     # V3：应用量价交易 Gate
     # =========================
     gate_result = final_with_sim.apply(
-        lambda row: obv_ad_trade_gate(row['obv_ad_interpretation'], row.get('trend_strength'), market_regime=market_regime if 'market_regime' in globals() else None),
+        lambda row: obv_ad_trade_gate(row['obv_ad_interpretation'], row.get('trend_strength')),
         axis=1
     )
+    # print(f"\n🛡️  量价交易 Gate 结果统计: {gate_result}")
     final_with_sim['allow_trade'] = gate_result.apply(lambda x: x[0])
     final_with_sim['trade_state'] = gate_result.apply(lambda x: x[1])
 
@@ -1872,7 +2419,7 @@ def main():
     print("-" * 150)
     display_cols = [
         "is_current_hold", "stock_code", "close", 
-        "ideal_entry", "hard_stop", "failure_stop", "rs_rank",
+        "ideal_entry", "failure_stop", "rs_rank",
         "hard_stop", "target_profit", "canslim_score",
         "quarterly_eps_growth", "annual_eps_growth",
         "revenue_growth", "roe", "shares_outstanding", 
