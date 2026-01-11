@@ -1258,7 +1258,13 @@ def extract_option_sentiment_from_yf(ticker: yf.Ticker) -> dict:
 
 def extract_uoa_structured_from_yf(t: yf.Ticker) -> dict:
     """
-    从 yfinance 构造机构级 UOA 结构字段
+    从 yfinance 构造【机构级】UOA 结构字段
+
+    返回字段说明：
+    - opt_uoa_score:   异常强度 (0~1)
+    - opt_uoa_call_bias: 方向性 (-1~1)，>0 偏多
+    - opt_uoa_avg_dte: 平均剩余期限（天）
+    - opt_uoa_type:   行为类型: none / event / institutional / long_term
     """
 
     empty_uoa = {
@@ -1273,46 +1279,66 @@ def extract_uoa_structured_from_yf(t: yf.Ticker) -> dict:
         if not expirations:
             return empty_uoa
 
-        opt_chain = t.option_chain(expirations[0])
+        # 只看最近到期（机构短期行为最集中）
+        exp = expirations[0]
+        opt_chain = t.option_chain(exp)
+
         calls = opt_chain.calls.copy()
-        puts = opt_chain.puts.copy()
+        puts  = opt_chain.puts.copy()
+
+        if calls.empty and puts.empty:
+            return empty_uoa
 
         calls["type"] = "CALL"
-        puts["type"] = "PUT"
+        puts["type"]  = "PUT"
 
         df = pd.concat([calls, puts], ignore_index=True)
 
-        # 防御
+        # ===== 基础防御 =====
         df = df[
             (df["volume"].fillna(0) > 0) &
             (df["openInterest"].fillna(0) >= 0)
         ]
 
         if df.empty:
-            return _empty_uoa()
+            return empty_uoa
 
-        # ===== 核心派生指标 =====
+        # ===== 派生指标 1：Volume / OI =====
         df["vol_oi_ratio"] = (
             df["volume"] /
             df["openInterest"].replace(0, np.nan)
         )
 
-        df["dte"] = (
-            pd.to_datetime(df["expiration"]) - pd.Timestamp.today()
-        ).dt.days
+        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["vol_oi_ratio"])
 
-        # ===== UOA 判定阈值（机构常用）=====
+        if df.empty:
+            return empty_uoa
+
+        # ===== 派生指标 2：DTE（用 expiration 算）=====
+        exp_date = pd.to_datetime(exp)
+        today = pd.Timestamp.today().normalize()
+
+        df["dte"] = (exp_date - today).days
+        df = df[df["dte"] > 0]
+
+        if df.empty:
+            return empty_uoa
+
+        # ===== UOA 判定（机构级）=====
+        # 条件：
+        # 1. 成交量 >= 100
+        # 2. volume >= openInterest * 3
         uoa_df = df[
-            (df["vol_oi_ratio"] >= 3) &
-            (df["volume"] >= 100)
+            (df["volume"] >= 100) &
+            (df["vol_oi_ratio"] >= 3)
         ]
 
         if uoa_df.empty:
-            return _empty_uoa()
+            return empty_uoa
 
-        # ===== 强度（归一化）=====
+        # ===== 强度评分（归一化）=====
         uoa_score = min(
-            uoa_df["vol_oi_ratio"].mean() / 10,
+            uoa_df["vol_oi_ratio"].mean() / 10.0,
             1.0
         )
 
@@ -1320,30 +1346,29 @@ def extract_uoa_structured_from_yf(t: yf.Ticker) -> dict:
         call_vol = uoa_df[uoa_df["type"] == "CALL"]["volume"].sum()
         put_vol  = uoa_df[uoa_df["type"] == "PUT"]["volume"].sum()
 
-        call_bias = (
-            (call_vol - put_vol) /
-            max(call_vol + put_vol, 1)
-        )
+        call_bias = (call_vol - put_vol) / max(call_vol + put_vol, 1)
 
         # ===== 平均 DTE =====
         avg_dte = uoa_df["dte"].mean()
 
-        # ===== 行为分类 =====
+        # ===== 行为分类（非常关键）=====
         if avg_dte <= 7:
-            uoa_type = "event"
+            uoa_type = "event"               # 财报 / FDA / 判决
         elif avg_dte <= 30:
-            uoa_type = "institutional"
+            uoa_type = "institutional"       # 典型机构 swing
         else:
-            uoa_type = "long_term"
+            uoa_type = "long_term"            # 长周期布局
 
         return {
-            "opt_uoa_score": round(uoa_score, 3),
-            "opt_uoa_call_bias": round(call_bias, 3),
-            "opt_uoa_avg_dte": round(avg_dte, 1),
+            "opt_uoa_score": round(float(uoa_score), 3),
+            "opt_uoa_call_bias": round(float(call_bias), 3),
+            "opt_uoa_avg_dte": round(float(avg_dte), 1),
             "opt_uoa_type": uoa_type,
         }
 
-    except Exception:
+    except Exception as e:
+        # 建议你临时打印一次看看真实错误
+        # print(f"[UOA ERROR] {t.ticker}: {e}")
         return empty_uoa
 
 
@@ -1374,14 +1399,6 @@ def update_fundamentals(con, ticker_list, force_update=False):
     print(f"🚀 开始更新 {len(need_update)} 只股票的基本面...")
     for symbol in need_update:
         try:
-            fundamentals_sql = f"""
-                SELECT stock_code FROM stock_fundamentals WHERE update_date >= CURRENT_DATE AND stock_code = '{symbol}'
-            """
-            fundamentals_sql_df = con.execute(fundamentals_sql).df()
-            if not fundamentals_sql_df.empty:
-                print(f"  [跳过] {symbol} 基本面数据在有效期内")
-                continue
-
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
 
