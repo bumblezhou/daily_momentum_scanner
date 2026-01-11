@@ -13,6 +13,8 @@ from datetime import date, datetime, timedelta
 import pandas_market_calendars as mcal
 import threading
 import queue
+import numpy as np
+from enum import Enum
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -1082,7 +1084,10 @@ def build_stage3_fundamental_fast(con, stage2_df: pd.DataFrame) -> pd.DataFrame:
             f.fcf_quality,
             f.shares_outstanding,
             f.inst_ownership,
-            f.market_cap
+            f.market_cap,
+            f.opt_pc_ratio,
+            f.opt_avg_iv,
+            f.opt_uoa_detected
         FROM stock_fundamentals f
         WHERE f.stock_code IN (SELECT stock_code FROM tmp_stage2) AND f.fcf_quality IS NOT NULL AND f.roe IS NOT NULL
     """
@@ -1107,9 +1112,239 @@ def init_fundamental_table(con):
             fcf_quality DOUBLE,                       -- 自由现金流质量（fcf / ocf）
             canslim_score INTEGER,                    -- CAN SLIM 综合得分（代码中计算）
             market_cap BIGINT,                        -- 市值（marketCap）
-            forward_eps_growth DOUBLE                 -- L: 前瞻每股收益增长率（计算得出）
+            forward_eps_growth DOUBLE,                -- L: 前瞻每股收益增长率（计算得出）
+            opt_pc_ratio DOUBLE DEFAULT 0,            -- 期权看涨(call)看跌(put)成交量比
+            opt_avg_iv DOUBLE DEFAULT 0,              -- 期权平均隐含波动率
+            opt_uoa_detected BOOLEAN DEFAULT FALSE,   -- 是否检测到异常期权活动
+            opt_uoa_score DOUBLE DEFAULT 0,           -- 异常期权强度（0~1）,下注规模
+            opt_uoa_call_bias DOUBLE DEFAULT 0,       -- 异常期权方向偏好：>0 偏多，<0 偏空
+            opt_uoa_avg_dte DOUBLE DEFAULT NULL,      -- 异常期权平均到期天数或下注周期：判断是事件还是趋势
+            opt_uoa_type VARCHAR DEFAULT NULL         -- 异常期权行为分类（institutional / event / noise）
         );
     """)
+
+
+def extract_option_sentiment_from_yf(ticker: yf.Ticker) -> dict:
+    """
+    从 yfinance 提取期权情绪指标（现实可行版本）
+
+    返回：
+    - opt_pc_ratio       : Put / Call 成交量比
+    - opt_avg_iv         : ATM 附近期权平均隐含波动率
+    - opt_uoa_detected   : 是否检测到异常期权活动（弱 UOA proxy）
+    """
+
+    try:
+        # =========================
+        # 0. 检查是否有期权数据
+        # =========================
+        expirations = ticker.options
+        if not expirations:
+            return {
+                "opt_pc_ratio": None,
+                "opt_avg_iv": None,
+                "opt_uoa_detected": False,
+                "underlying_price": None
+            }
+
+        # =========================
+        # 1. 获取最近到期日
+        # =========================
+        exp = expirations[0]
+        opt_chain = ticker.option_chain(exp)
+
+        calls = opt_chain.calls.copy()
+        puts = opt_chain.puts.copy()
+
+        if calls.empty or puts.empty:
+            return {
+                "opt_pc_ratio": None,
+                "opt_avg_iv": None,
+                "opt_uoa_detected": False,
+                "underlying_price": None
+            }
+
+        # =========================
+        # 2. 获取标的价格（稳定顺序）
+        # =========================
+        underlying_price = (
+            ticker.fast_info.get("lastPrice")
+            or ticker.fast_info.get("regularMarketPrice")
+            or ticker.info.get("regularMarketPrice")
+        )
+
+        # =========================
+        # A. Put / Call Ratio（成交量）
+        # =========================
+        call_vol = calls["volume"].fillna(0).sum()
+        put_vol = puts["volume"].fillna(0).sum()
+        pc_ratio = round(put_vol / call_vol, 3) if call_vol > 0 else None
+
+        # =========================
+        # B. ATM 附近平均 IV
+        # =========================
+        if underlying_price:
+            lower = underlying_price * 0.85
+            upper = underlying_price * 1.15
+
+            mask_c = (calls["strike"] >= lower) & (calls["strike"] <= upper)
+            mask_p = (puts["strike"]  >= lower) & (puts["strike"]  <= upper)
+
+            relevant_iv = pd.concat(
+                [
+                    calls.loc[mask_c, "impliedVolatility"],
+                    puts.loc[mask_p,  "impliedVolatility"]
+                ],
+                ignore_index=True
+            )
+        else:
+            relevant_iv = pd.concat(
+                [calls["impliedVolatility"], puts["impliedVolatility"]],
+                ignore_index=True
+            )
+
+        # 清洗 IV
+        relevant_iv = (
+            relevant_iv
+            .replace(0, np.nan)
+            .dropna()
+        )
+
+        # 过滤极端异常值（流动性导致的假 IV）
+        relevant_iv = relevant_iv[relevant_iv.between(0.05, 1.5)]
+
+        avg_iv = round(float(relevant_iv.mean()), 4) if not relevant_iv.empty else None
+
+        # =========================
+        # C. 弱 UOA（异常期权活动）检测
+        # =========================
+        # 定义：成交量显著大于持仓量，且达到最小规模
+        UOA_MIN_VOLUME = 100
+
+        def detect_uoa(df: pd.DataFrame) -> bool:
+            if df.empty:
+                return False
+
+            if "volume" not in df.columns or "openInterest" not in df.columns:
+                return False
+
+            vol = df["volume"].fillna(0)
+            oi = df["openInterest"].fillna(0)
+
+            uoa_mask = (vol >= UOA_MIN_VOLUME) & (vol > oi * 2)
+            return bool(uoa_mask.any())
+
+        uoa_flag = detect_uoa(calls) or detect_uoa(puts)
+
+        # =========================
+        # 返回
+        # =========================
+        return {
+            "opt_pc_ratio": pc_ratio,
+            "opt_avg_iv": avg_iv,
+            "opt_uoa_detected": uoa_flag,
+            "underlying_price": round(float(underlying_price), 2) if underlying_price else None
+        }
+
+    except Exception as e:
+        return {
+            "opt_pc_ratio": None,
+            "opt_avg_iv": None,
+            "opt_uoa_detected": False,
+            "underlying_price": None,
+            "error": str(e)
+        }
+
+
+def extract_uoa_structured_from_yf(t: yf.Ticker) -> dict:
+    """
+    从 yfinance 构造机构级 UOA 结构字段
+    """
+
+    empty_uoa = {
+        "opt_uoa_score": 0.0,
+        "opt_uoa_call_bias": 0.0,
+        "opt_uoa_avg_dte": None,
+        "opt_uoa_type": "none",
+    }
+
+    try:
+        expirations = t.options
+        if not expirations:
+            return empty_uoa
+
+        opt_chain = t.option_chain(expirations[0])
+        calls = opt_chain.calls.copy()
+        puts = opt_chain.puts.copy()
+
+        calls["type"] = "CALL"
+        puts["type"] = "PUT"
+
+        df = pd.concat([calls, puts], ignore_index=True)
+
+        # 防御
+        df = df[
+            (df["volume"].fillna(0) > 0) &
+            (df["openInterest"].fillna(0) >= 0)
+        ]
+
+        if df.empty:
+            return _empty_uoa()
+
+        # ===== 核心派生指标 =====
+        df["vol_oi_ratio"] = (
+            df["volume"] /
+            df["openInterest"].replace(0, np.nan)
+        )
+
+        df["dte"] = (
+            pd.to_datetime(df["expiration"]) - pd.Timestamp.today()
+        ).dt.days
+
+        # ===== UOA 判定阈值（机构常用）=====
+        uoa_df = df[
+            (df["vol_oi_ratio"] >= 3) &
+            (df["volume"] >= 100)
+        ]
+
+        if uoa_df.empty:
+            return _empty_uoa()
+
+        # ===== 强度（归一化）=====
+        uoa_score = min(
+            uoa_df["vol_oi_ratio"].mean() / 10,
+            1.0
+        )
+
+        # ===== 方向性 =====
+        call_vol = uoa_df[uoa_df["type"] == "CALL"]["volume"].sum()
+        put_vol  = uoa_df[uoa_df["type"] == "PUT"]["volume"].sum()
+
+        call_bias = (
+            (call_vol - put_vol) /
+            max(call_vol + put_vol, 1)
+        )
+
+        # ===== 平均 DTE =====
+        avg_dte = uoa_df["dte"].mean()
+
+        # ===== 行为分类 =====
+        if avg_dte <= 7:
+            uoa_type = "event"
+        elif avg_dte <= 30:
+            uoa_type = "institutional"
+        else:
+            uoa_type = "long_term"
+
+        return {
+            "opt_uoa_score": round(uoa_score, 3),
+            "opt_uoa_call_bias": round(call_bias, 3),
+            "opt_uoa_avg_dte": round(avg_dte, 1),
+            "opt_uoa_type": uoa_type,
+        }
+
+    except Exception:
+        return empty_uoa
 
 
 # 编写“增量更新”脚本（扩展为 CAN SLIM）
@@ -1149,6 +1384,17 @@ def update_fundamentals(con, ticker_list, force_update=False):
 
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
+
+            # 提取期权情绪数据
+            option_sentiment = extract_option_sentiment_from_yf(t)
+
+            # === 期权 UOA（结构化） ===
+            uoa_struct = extract_uoa_structured_from_yf(t)
+
+            opt_uoa_score = uoa_struct["opt_uoa_score"]
+            opt_uoa_call_bias = uoa_struct["opt_uoa_call_bias"]
+            opt_uoa_avg_dte = uoa_struct["opt_uoa_avg_dte"]
+            opt_uoa_type = uoa_struct["opt_uoa_type"]
 
             # --- 金律字段提取 ---
             market_cap = info.get('marketCap', 0) or 0
@@ -1209,8 +1455,25 @@ def update_fundamentals(con, ticker_list, force_update=False):
             # 使用 UPSERT 逻辑
             con.execute("""
                 INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, quarterly_eps_growth, annual_eps_growth,  rev_growth, roe, shares_outstanding, inst_own, fcf_quality, score, market_cap, 0)
+                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, 
+                  quarterly_eps_growth, 
+                  annual_eps_growth, 
+                  rev_growth, 
+                  roe, 
+                  shares_outstanding, 
+                  inst_own, 
+                  fcf_quality, 
+                  score, 
+                  market_cap, 
+                  0, 
+                  option_sentiment.get("opt_pc_ratio"), 
+                  option_sentiment.get("opt_avg_iv"), 
+                  option_sentiment.get("opt_uoa_detected"),
+                  opt_uoa_score,
+                  opt_uoa_call_bias,
+                  opt_uoa_avg_dte,
+                  opt_uoa_type)
             )
 
         except Exception as e:
@@ -1726,6 +1989,7 @@ OBV_SCORE_MAP = {
     "派发阶段": 0.00           # 资金持续流出
 }
 
+# 趋势强度调制因子
 TREND_STRENGTH_MULTIPLIER = {
     "strong_uptrend": 1.15,
     "uptrend": 1.05,
@@ -1783,10 +2047,180 @@ def compute_trade_score(row, sector_avg_rs: pd.DataFrame) -> float:
 
     final_score = base_score + sector_bonus
 
+    # === 期权情绪调制 ===
+    option_mult = option_sentiment_multiplier(row)
+    final_score *= option_mult
+
     return round(
         max(0.0, min(final_score * 100, 100.0)),
         2
     )
+
+# =========================
+# V3.1 修改：期权风险保险丝（结构化 UOA）
+# =========================
+def options_risk_gate(row) -> bool:
+    """
+    第一层：期权风险保险丝（V3.1）
+    机构逻辑：
+    - 只拦截「末端狂欢」
+    - 不拦截「机构趋势建仓」
+    """
+
+    pc = row.get("opt_pc_ratio")
+    iv = row.get("opt_avg_iv")
+
+    # === V3.1 新增：结构化 UOA ===
+    uoa_type = row.get("opt_uoa_type", "none")
+    uoa_score = row.get("opt_uoa_score", 0.0)
+    uoa_call_bias = row.get("opt_uoa_call_bias", 0.0)
+
+    # === 兼容旧逻辑 ===
+    uoa_detected = row.get("opt_uoa_detected", False)
+
+    # 数据缺失 → 不否决
+    if pc is None or iv is None:
+        return True
+
+    # === V3.1 核心否决条件 ===
+    # 极端情绪 + IV 透支 + 明显事件型期权
+    if (
+        pc < 0.4
+        and iv > 1.1
+        and (
+            uoa_type == "event"
+            or (uoa_detected and uoa_score < 0.3)
+        )
+    ):
+        # 这是「末尾狂欢」而不是机构建仓
+        return False
+
+    return True
+
+
+# =========================
+# V3.1 修改：期权情绪调制因子（结构化 UOA）
+# =========================
+def option_sentiment_multiplier(row) -> float:
+    """
+    第二层：期权情绪调制因子（V3.1）
+    用于放大 / 压缩 trade_score
+    """
+
+    multiplier = 1.0
+
+    pc = row.get("opt_pc_ratio")
+    iv = row.get("opt_avg_iv")
+
+    # === V3.1 新增：结构化 UOA ===
+    uoa_type = row.get("opt_uoa_type", "none")
+    uoa_score = row.get("opt_uoa_score", 0.0)
+    uoa_call_bias = row.get("opt_uoa_call_bias", 0.0)
+
+    # === 1️⃣ Put/Call 情绪（顺势） ===
+    if pc is not None:
+        if pc < 0.6:
+            multiplier *= 1.15
+        elif pc > 1.3:
+            multiplier *= 0.80
+
+    # === 2️⃣ IV 风险（真正过热） ===
+    if iv is not None and iv > 0.95:
+        multiplier *= 0.75
+
+    # === 3️⃣ 机构级 UOA 加权（核心升级） ===
+    if (
+        uoa_type == "institutional"
+        and uoa_score > 0.4
+        and uoa_call_bias > 0
+    ):
+        # 趋势型机构建仓
+        multiplier *= (1.0 + min(uoa_score, 0.3))
+
+    # === 4️⃣ 事件型 UOA 惩罚 ===
+    if uoa_type == "event":
+        multiplier *= 0.7
+
+    # === 5️⃣ 方向不一致惩罚 ===
+    if uoa_call_bias < 0:
+        multiplier *= 0.8
+
+    # === 最大上限保护 ===
+    multiplier = min(multiplier, 1.3)
+
+    return multiplier
+
+
+# =========================
+# V3 新增：期权情绪状态枚举
+# =========================
+class OptionSentimentState(Enum):
+    NEUTRAL = "neutral"                 # 正常              不影响
+    BULLISH_BUT_CROWDED = "crowded"     # 看多但拥挤        降仓/慢买  
+    BEARISH_HEDGE = "bearish_hedge"     # 防御性看空        延后/观望
+    EVENT_RISK = "event_risk"           # 事件风险          禁止追
+    SMART_MONEY_BULLISH = "smart_bull"  # 聪明钱偏多        可加权
+
+
+# =========================
+# V3 新增：期权情绪状态中文映射
+# =========================
+OPTION_STATE_CN_MAP = {
+    OptionSentimentState.NEUTRAL: "中性",
+    OptionSentimentState.BULLISH_BUT_CROWDED: "多头拥挤",
+    OptionSentimentState.BEARISH_HEDGE: "防御性对冲",
+    OptionSentimentState.EVENT_RISK: "事件风险",
+    OptionSentimentState.SMART_MONEY_BULLISH: "机构偏多",
+}
+
+
+# =========================
+# V3.1 修改：期权情绪状态解析（结构化 UOA）
+# =========================
+def resolve_option_sentiment_state(row) -> OptionSentimentState:
+    """
+    将期权原始指标 → 离散状态（V3.1）
+    """
+
+    pc = row.get("opt_pc_ratio")
+    iv = row.get("opt_avg_iv")
+    rs_rank = row.get("rs_rank", 0)
+
+    # === V3.1 新增：结构化 UOA ===
+    uoa_type = row.get("opt_uoa_type", "none")
+    uoa_score = row.get("opt_uoa_score", 0.0)
+    uoa_call_bias = row.get("opt_uoa_call_bias", 0.0)
+
+    # 缺数据 → 中性
+    if pc is None or iv is None:
+        return OptionSentimentState.NEUTRAL
+
+    # === 1️⃣ 事件风险 ===
+    if iv > 0.95 and uoa_type == "event":
+        return OptionSentimentState.EVENT_RISK
+
+    # === 2️⃣ 机构偏多（最优） ===
+    if (
+        uoa_type == "institutional"
+        and uoa_score > 0.4
+        and uoa_call_bias > 0
+        and iv < 0.85
+    ):
+        return OptionSentimentState.SMART_MONEY_BULLISH
+
+    # === 3️⃣ 多头拥挤 ===
+    if pc < 0.5:
+        if rs_rank > 90 and iv > 0.7:
+            return OptionSentimentState.BULLISH_BUT_CROWDED
+        else:
+            # 非拥挤 → 动量确认
+            return OptionSentimentState.SMART_MONEY_BULLISH
+
+    # === 4️⃣ 防御性对冲 ===
+    if pc > 1.3 or uoa_call_bias < 0:
+        return OptionSentimentState.BEARISH_HEDGE
+
+    return OptionSentimentState.NEUTRAL
 
 
 def check_data_integrity(con):
@@ -1867,6 +2301,28 @@ def check_data_integrity(con):
         print(f"✅ 数据看起来正常，有 {latest_price_count} 支股票可供筛选")
     
     print("="*80 + "\n")
+
+    # 如果数据严重不足，给出警告和选项
+    if latest_price_count < 100:
+        print("\n" + "="*80)
+        print("⚠️  警告：数据库中股票数量严重不足！")
+        print("="*80)
+        print("\n请选择以下操作之一：")
+        print("1. 全量下载所有股票价格（首次运行，耗时较长）")
+        print("2. 重置yf标记后增量更新")
+        print("3. 忽略警告继续运行（仅用于测试）")
+        print("\n如需执行操作1或2，请在代码中取消相应注释")
+        print("="*80 + "\n")
+        
+        # 🔥 选项1：全量下载（取消下面注释）
+        # fetch_all_prices()
+        
+        # 🔥 选项2：重置标记（取消下面注释）
+        # reset_yf_availability(con)
+        # update_recent_prices([])  # 空列表=更新所有缺失的
+        
+        # 🔥 选项3：继续运行（默认）
+        print("⏭️  继续使用现有数据运行...")
     
     return latest_price_count
 
@@ -2222,29 +2678,7 @@ def main():
     )
 
     # 🔥 新增：先检查数据完整性
-    stock_count = check_data_integrity(con)
-    
-    # 如果数据严重不足，给出警告和选项
-    if stock_count < 100:
-        print("\n" + "="*80)
-        print("⚠️  警告：数据库中股票数量严重不足！")
-        print("="*80)
-        print("\n请选择以下操作之一：")
-        print("1. 全量下载所有股票价格（首次运行，耗时较长）")
-        print("2. 重置yf标记后增量更新")
-        print("3. 忽略警告继续运行（仅用于测试）")
-        print("\n如需执行操作1或2，请在代码中取消相应注释")
-        print("="*80 + "\n")
-        
-        # 🔥 选项1：全量下载（取消下面注释）
-        # fetch_all_prices()
-        
-        # 🔥 选项2：重置标记（取消下面注释）
-        # reset_yf_availability(con)
-        # update_recent_prices([])  # 空列表=更新所有缺失的
-        
-        # 🔥 选项3：继续运行（默认）
-        print("⏭️  继续使用现有数据运行...")
+    check_data_integrity(con)
 
     # 先更新所有基本面数据（包含监控名单）
     update_fundamentals(con, get_tickers_missing_recent_data(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=True)
@@ -2267,8 +2701,8 @@ def main():
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
-    # stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     
     print(f"Stage 2 股票数量: {len(stage2)}")
     
@@ -2391,6 +2825,22 @@ def main():
     final_with_sim['allow_trade'] = gate_result.apply(lambda x: x[0])
     final_with_sim['trade_state'] = gate_result.apply(lambda x: x[1])
 
+    # 在允许交易的基础上，应用期权风险保险丝
+    final_with_sim["allow_trade"] = (
+        final_with_sim["allow_trade"]
+        & final_with_sim.apply(options_risk_gate, axis=1)
+    )
+
+    # 添加期权情绪状态
+    final_with_sim["option_state"] = final_with_sim.apply(
+        resolve_option_sentiment_state,
+        axis=1
+    )
+    # 把期权情绪状态映射为中文
+    final_with_sim["option_state_cn"] = final_with_sim["option_state"].map(
+        OPTION_STATE_CN_MAP
+    )
+
     # =========================
     # V3：生成最终交易评分
     # =========================
@@ -2425,7 +2875,7 @@ def main():
         "revenue_growth", "roe", "shares_outstanding", 
         "inst_ownership", "fcf_quality", "market_cap", 'sector', 
         'trade_state', 'trade_score', 'obv_ad_interpretation', 
-        'obv_slope_20', 'ad_slope_20'
+        'trend_strength','option_state_cn'
     ]
     print(final_with_sim[display_cols].to_string(index=False))
 
