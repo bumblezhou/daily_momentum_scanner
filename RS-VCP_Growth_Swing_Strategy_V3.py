@@ -2869,7 +2869,7 @@ def main():
     check_data_integrity(con)
 
     # 先更新所有基本面数据（包含监控名单）
-    update_fundamentals(con, get_tickers_missing_recent_data(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=True)
+    update_fundamentals(con, get_tickers_missing_recent_data(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=False)
 
     # 🚀 修复点：自动获取库中最新的交易日期
     latest_date_in_db = get_latest_date_in_db()
@@ -2892,8 +2892,8 @@ def main():
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
-    # stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     
     print(f"Stage 2 股票数量: {len(stage2)}")
 
