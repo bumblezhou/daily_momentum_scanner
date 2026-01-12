@@ -773,7 +773,16 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
         r.rs_20, r.rs_20_10days_ago,
         p.pivot_price,
         v.volume, v.vol20, v.vol50,
-        ph.high_5d
+        ph.high_5d,
+        vt.obv,
+        vt.obv_ma20,
+        vt.obv_slope_20,
+        vt.obv_slope_5,
+        vt.ad,
+        vt.ad_slope_20,
+        vt.ad_slope_5,
+        vt.vol20,
+        vt.vol_rs
 
     FROM base b
     JOIN rs_ranked r USING (stock_code, trade_date)
@@ -781,6 +790,9 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
     JOIN pivot_data p USING (stock_code, trade_date)
     JOIN volume_check v USING (stock_code, trade_date)
     JOIN prev_high ph USING (stock_code, trade_date)
+    LEFT JOIN stock_volume_trend vt
+        ON b.stock_code = vt.stock_code
+        AND b.trade_date = vt.trade_date
 
     WHERE
         b.trade_date = DATE '{target_date}'
@@ -1039,7 +1051,16 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
         r.rs_20, r.rs_20_10days_ago,
         p.pivot_price,
         v.volume, v.vol20, v.vol50,
-        ph.high_5d
+        ph.high_5d,
+        vt.obv,
+        vt.obv_ma20,
+        vt.obv_slope_20,
+        vt.obv_slope_5,
+        vt.ad,
+        vt.ad_slope_20,
+        vt.ad_slope_5,
+        vt.vol20,
+        vt.vol_rs
 
     FROM base b
     JOIN rs_ranked r USING (stock_code, trade_date)
@@ -1047,6 +1068,9 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
     JOIN pivot_data p USING (stock_code, trade_date)
     JOIN volume_check v USING (stock_code, trade_date)
     JOIN prev_high ph USING (stock_code, trade_date)
+    LEFT JOIN stock_volume_trend vt
+        ON b.stock_code = vt.stock_code
+        AND b.trade_date = vt.trade_date
 
     WHERE
         b.trade_date = DATE '{target_date}'
@@ -1651,37 +1675,6 @@ def check_market_regime(con) -> dict:
         "qqq_close": qqq_close,
         "qqq_ma50": qqq_ma50
     }
-
-
-def build_stage2_with_volume_trend(con, stage2_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    在不修改 Stage2 原有逻辑的前提下，
-    为结果外挂 OBV / AD 量价趋势特征
-    """
-    if stage2_df.empty:
-        return stage2_df
-
-    con.register("tmp_stage2", stage2_df)
-
-    sql = """
-    SELECT
-        s.*,
-        v.obv,
-        v.obv_ma20,
-        v.obv_slope_20,
-        v.obv_slope_5,
-        v.ad,
-        v.ad_slope_20,
-        v.ad_slope_5,
-        v.vol20,
-        v.vol_rs
-    FROM tmp_stage2 s
-    LEFT JOIN stock_volume_trend v
-        ON s.stock_code = v.stock_code
-        AND s.trade_date = v.trade_date
-    """
-
-    return con.execute(sql).df()
 
 
 def update_volume_trend_features(con, latest_trading_day: str):
@@ -2664,6 +2657,184 @@ def build_price_history_map(
     return price_history_map
 
 
+# =========================
+# V3 新增：入场区间计算（含 VIX 调节因子）
+# =========================
+def calculate_entry_zone_vix(
+    close: float,
+    vwap: float | None,
+    atr: float | None,
+    premarket_high: float | None,
+    trend_strength: str,
+    current_vix: float
+) -> tuple[str, float]:
+
+    if atr is None or atr <= 0:
+        atr = close * 0.03
+
+    vix_mult = get_vix_multiplier(current_vix)
+    adj_atr = atr * vix_mult
+
+    if trend_strength in ("strong_uptrend", "uptrend"):
+        base = max(
+            close * 0.995,
+            vwap if vwap else 0,
+            premarket_high if premarket_high else 0
+        )
+        entry_low = base
+        entry_high = base + adj_atr * 0.3
+    else:
+        base = vwap if vwap else close
+        entry_low = base - adj_atr * 0.5
+        entry_high = base + adj_atr * 0.2
+
+    entry_low = max(entry_low, close * 0.96)
+    entry_high = min(entry_high, close * 1.04)
+
+    return f"{entry_low:.2f} - {entry_high:.2f}", round(entry_high, 2)
+
+
+# =========================
+# V3 新增：止损价计算（含 VIX 调节因子）
+# =========================
+def calculate_hard_stop_vix(
+    entry_price: float,
+    atr: float | None,
+    current_vix: float
+) -> float:
+
+    if atr is None or atr <= 0:
+        atr = entry_price * 0.03
+
+    vix_mult = get_vix_multiplier(current_vix)
+    stop = entry_price - atr * 1.2 * vix_mult
+
+    return round(stop, 2)
+
+
+# =========================
+# V3 新增：目标价计算（含 VIX 调节因子）
+# =========================
+def calculate_target_price_vix(
+    close: float,
+    atr: float | None,
+    trend_strength: str,
+    rs_rank: float,
+    current_vix: float
+) -> float:
+
+    if atr is None or atr <= 0:
+        atr = close * 0.03
+
+    vix_mult = get_vix_multiplier(current_vix)
+    adj_atr = atr * vix_mult
+
+    if trend_strength == "strong_uptrend":
+        atr_mult = 3.0 if rs_rank > 90 else 2.5
+    elif trend_strength == "uptrend":
+        atr_mult = 2.0
+    elif trend_strength == "trend_pullback":
+        atr_mult = 1.5
+    else:
+        atr_mult = 1.2
+
+    target = close + adj_atr * atr_mult
+    return round(min(target, close * 1.35), 2)
+
+# =========================
+# V3 新增：VIX 波动率调节因子
+# =========================
+def get_vix_multiplier(current_vix: float) -> float:
+    if current_vix >= 30:
+        return 1.5
+    elif current_vix >= 24:
+        return 1.3
+    elif current_vix >= 18:
+        return 1.15
+    else:
+        return 1.0
+
+
+# =========================
+# V3 新增：批量注入入场区间、止损价、目标价（含 VIX 调节因子）
+# =========================
+def apply_entry_stop_target_vix(
+    df,
+    current_vix: float
+):
+    """
+    VIX-aware Entry / Stop / Target 注入
+    保留 atr_15 / vix_adj，确保下游代码不崩
+    """
+
+    ideal_entry_list = []
+    entry_price_list = []
+    hard_stop_list = []
+    target_profit_list = []
+    atr_15_list = []
+    vix_adj_list = []
+
+    vix_factor = get_vix_multiplier(current_vix)
+
+    for _, row in df.iterrows():
+
+        close = row["close"]
+        atr = row.get("atr")
+        vwap = row.get("vwap")
+        premarket_high = row.get("premarket_high")
+        trend_strength = row.get("trend_strength", "unknown")
+        rs_rank = row.get("rs_rank", 0)
+
+        # === ATR 兜底 ===
+        if atr is None or atr <= 0:
+            atr = close * 0.03
+
+        # === Entry ===
+        ideal_entry, entry_price = calculate_entry_zone_vix(
+            close=close,
+            vwap=vwap,
+            atr=atr,
+            premarket_high=premarket_high,
+            trend_strength=trend_strength,
+            current_vix=current_vix
+        )
+
+        # === Hard Stop ===
+        hard_stop = calculate_hard_stop_vix(
+            entry_price=entry_price,
+            atr=atr,
+            current_vix=current_vix
+        )
+
+        # === Target ===
+        target_profit = calculate_target_price_vix(
+            close=close,
+            atr=atr,
+            trend_strength=trend_strength,
+            rs_rank=rs_rank,
+            current_vix=current_vix
+        )
+
+        ideal_entry_list.append(ideal_entry)
+        entry_price_list.append(entry_price)
+        hard_stop_list.append(hard_stop)
+        target_profit_list.append(target_profit)
+
+        # === 兼容旧 schema 的字段 ===
+        atr_15_list.append(round(atr, 2))
+        vix_adj_list.append(round(vix_factor, 2))
+
+    df = df.copy()
+    df["ideal_entry"] = ideal_entry_list
+    df["entry_price"] = entry_price_list
+    df["hard_stop"] = hard_stop_list
+    df["target_profit"] = target_profit_list
+    df["atr_15"] = atr_15_list
+    df["vix_adj"] = vix_adj_list
+
+    return df
+
+
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
 CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "ORCL", "CDE", "BABA"]
@@ -2716,18 +2887,15 @@ def main():
     # 🔥 新增：运行诊断
     diagnose_stage2_filters(con, latest_date_in_db)
 
-    # 4️⃣ Stage 2: SwingTrend 技术筛选
-    print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
-    stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
-    
-    print(f"Stage 2 股票数量: {len(stage2)}")
-    
     # 更新量价趋势特征表
     update_volume_trend_features(con, latest_date_in_db)
 
-    # 挂载量价趋势特征
-    stage2 = build_stage2_with_volume_trend(con, stage2)
+    # 4️⃣ Stage 2: SwingTrend 技术筛选
+    print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
+    stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    # stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    
+    print(f"Stage 2 股票数量: {len(stage2)}")
 
     if stage2.empty:
         print("❌ 今日无符合技术面筛选的股票，程序结束。")
@@ -2770,18 +2938,18 @@ def main():
         current_vix = 18.0
 
     # 注入回撤模拟数据
-    print("🛠️ 正在计算个股波动容错区间...")
-    pullback_list = []
-    for ticker in final_filtered['stock_code']:
-        p_data = simulate_pullback_range(con, ticker, current_vix=current_vix)
-        pullback_list.append(p_data if p_data else {})
+    # 注入 VIX-aware Entry / Stop / Target
+    print("🛠️ 注入 VIX-aware Entry / Stop / Target ...")
+    final_filtered = apply_entry_stop_target_vix(
+        final_filtered,
+        current_vix=current_vix
+    )
     
     # 关闭连接
     con.close()
     
     # 合并模拟结果
-    pullback_df = pd.DataFrame(pullback_list)
-    final_with_sim = pd.concat([final_filtered.reset_index(drop=True), pullback_df], axis=1)
+    final_with_sim = final_filtered
 
     # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
     final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
@@ -2885,9 +3053,9 @@ def main():
     print("\n✅ 最终买入候选及波动模拟 (含 VIX 调节)")
     print("-" * 150)
     display_cols = [
-        "is_current_hold", "stock_code", "close", 
-        "ideal_entry", "failure_stop", "rs_rank",
-        "hard_stop", "target_profit", "canslim_score",
+        "is_current_hold", "stock_code", "close",
+        "ideal_entry", "entry_price", "hard_stop",
+        "target_profit", "rs_rank","canslim_score",
         "quarterly_eps_growth", "annual_eps_growth",
         "revenue_growth", "roe", "shares_outstanding", 
         "inst_ownership", "fcf_quality", "market_cap", 'sector', 
