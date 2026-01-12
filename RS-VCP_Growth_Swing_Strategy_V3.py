@@ -758,6 +758,21 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
                 ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
             ) AS high_5d
         FROM stock_price
+    ),
+
+    latest_fundamentals AS (
+        SELECT *
+        FROM (
+            SELECT
+                sf.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sf.stock_code
+                    ORDER BY sf.update_date DESC
+                ) AS rn
+            FROM stock_fundamentals sf
+            WHERE sf.update_date IS NOT NULL
+        )
+        WHERE rn = 1
     )
 
     SELECT
@@ -782,8 +797,20 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
         vt.ad_slope_20,
         vt.ad_slope_5,
         vt.vol20,
-        vt.vol_rs
-
+        vt.vol_rs,
+        f.canslim_score,
+        f.quarterly_eps_growth,
+        f.annual_eps_growth,
+        f.forward_eps_growth,
+        f.roe,
+        f.revenue_growth,
+        f.fcf_quality,
+        f.shares_outstanding,
+        f.inst_ownership,
+        f.market_cap,
+        f.opt_pc_ratio,
+        f.opt_avg_iv,
+        f.opt_uoa_detected
     FROM base b
     JOIN rs_ranked r USING (stock_code, trade_date)
     JOIN atr_stats a USING (stock_code, trade_date)
@@ -793,7 +820,8 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
     LEFT JOIN stock_volume_trend vt
         ON b.stock_code = vt.stock_code
         AND b.trade_date = vt.trade_date
-
+    INNER JOIN latest_fundamentals f
+        ON b.stock_code = f.stock_code
     WHERE
         b.trade_date = DATE '{target_date}'
         AND (
@@ -803,6 +831,9 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
             OR
             b.stock_code IN ({monitor_str})
         )
+        AND f.roe IS NOT NULL
+        AND f.fcf_quality IS NOT NULL
+        AND f.market_cap >= 1e9
 
     """
 
@@ -1036,6 +1067,21 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
                 ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
             ) AS high_5d
         FROM stock_price
+    ),
+
+    latest_fundamentals AS (
+        SELECT *
+        FROM (
+            SELECT
+                sf.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sf.stock_code
+                    ORDER BY sf.update_date DESC
+                ) AS rn
+            FROM stock_fundamentals sf
+            WHERE sf.update_date IS NOT NULL
+        )
+        WHERE rn = 1
     )
 
     SELECT
@@ -1060,8 +1106,20 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
         vt.ad_slope_20,
         vt.ad_slope_5,
         vt.vol20,
-        vt.vol_rs
-
+        vt.vol_rs,
+        f.canslim_score,
+        f.quarterly_eps_growth,
+        f.annual_eps_growth,
+        f.forward_eps_growth,
+        f.roe,
+        f.revenue_growth,
+        f.fcf_quality,
+        f.shares_outstanding,
+        f.inst_ownership,
+        f.market_cap,
+        f.opt_pc_ratio,
+        f.opt_avg_iv,
+        f.opt_uoa_detected
     FROM base b
     JOIN rs_ranked r USING (stock_code, trade_date)
     JOIN atr_stats a USING (stock_code, trade_date)
@@ -1071,7 +1129,8 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
     LEFT JOIN stock_volume_trend vt
         ON b.stock_code = vt.stock_code
         AND b.trade_date = vt.trade_date
-
+    INNER JOIN latest_fundamentals f
+        ON b.stock_code = f.stock_code
     WHERE
         b.trade_date = DATE '{target_date}'
         AND (
@@ -1079,45 +1138,13 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
             OR
             b.stock_code IN ({monitor_str})
         )
+        AND f.roe IS NOT NULL
+        AND f.fcf_quality IS NOT NULL
+        AND f.market_cap >= 1e9
     """
     
     df = con.execute(sql).df()
     return df
-
-
-def build_stage3_fundamental_fast(con, stage2_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    从本地 DuckDB 直接获取基本面评分 (极速版)
-    """
-    if stage2_df.empty:
-        return pd.DataFrame()
-
-    # 将 Stage 2 的结果注册为临时表，方便与基本面表 JOIN
-    con.register("tmp_stage2", stage2_df)
-
-    # 💡 核心修正：只选择基本面相关的列 + 关联主键
-    sql = """
-        SELECT 
-            f.stock_code,
-            f.canslim_score,
-            f.quarterly_eps_growth,
-            f.annual_eps_growth,
-            f.forward_eps_growth,
-            f.roe,
-            f.revenue_growth,
-            f.fcf_quality,
-            f.shares_outstanding,
-            f.inst_ownership,
-            f.market_cap,
-            f.opt_pc_ratio,
-            f.opt_avg_iv,
-            f.opt_uoa_detected
-        FROM stock_fundamentals f
-        WHERE f.stock_code IN (SELECT stock_code FROM tmp_stage2) AND f.fcf_quality IS NOT NULL AND f.roe IS NOT NULL
-    """
-    
-    result_df = con.execute(sql).df()
-    return result_df
 
 
 # 创建基本面数据表结构
@@ -2890,23 +2917,24 @@ def main():
     # 更新量价趋势特征表
     update_volume_trend_features(con, latest_date_in_db)
 
-    # 4️⃣ Stage 2: SwingTrend 技术筛选
-    print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    # # 4️⃣ Stage 2: SwingTrend 技术筛选
+    # print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
+    # # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
-    
     print(f"Stage 2 股票数量: {len(stage2)}")
 
-    if stage2.empty:
-        print("❌ 今日无符合技术面筛选的股票，程序结束。")
-        return # 或者保存一个空结果
+    # if stage2.empty:
+    #     print("❌ 今日无符合技术面筛选的股票，程序结束。")
+    #     return # 或者保存一个空结果
 
-    # 5️⃣ Stage 3: 基本面分析
-    print("📊 Stage 3: 基本面分析")
-    stage3 = build_stage3_fundamental_fast(con, stage2)
+    # # 5️⃣ Stage 3: 基本面分析
+    # print("📊 Stage 3: 基本面分析")
+    # stage3 = build_stage3_fundamental_fast(con, stage2)
+    # print(f"Stage 3 股票数量: {len(stage3)}")
 
     # 合并结果
-    final = stage2.merge(stage3, on="stock_code", how="left")
+    # final = stage2.merge(stage3, on="stock_code", how="left")
+    final = stage2.copy()
     # 填充缺失的基本面分数为 0，防止 query 报错
     final["canslim_score"] = final["canslim_score"].fillna(0)
 
@@ -2921,7 +2949,7 @@ def main():
     # 暂时降低过滤门槛以确保有输出
     final_filtered = (
         final
-        .query("canslim_score > 0 and market_cap >= 1_000_000_000 and quarterly_eps_growth.notna()")
+        .query("market_cap >= 1_000_000_000 and quarterly_eps_growth.notna()")
         .sort_values(["canslim_score", "rs_rank", "is_current_hold"], ascending=False)
     )
 
