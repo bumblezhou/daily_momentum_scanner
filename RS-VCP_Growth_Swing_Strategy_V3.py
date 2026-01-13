@@ -364,7 +364,6 @@ def update_recent_prices(watchlist: list = []):
     print(f"🎯 目标同步日期: {target_date}")
 
     target_date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
-    stale_limit = target_date_obj - timedelta(days=7)
 
     raw_tickers = get_tickers_missing_recent_data(trading_days)
     if not raw_tickers and not watchlist:
@@ -2896,7 +2895,7 @@ def main():
     check_data_integrity(con)
 
     # 先更新所有基本面数据（包含监控名单）
-    update_fundamentals(con, get_tickers_missing_recent_data(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=False)
+    update_fundamentals(con, get_tickers_missing_recent_data(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=True)
 
     # 🚀 修复点：自动获取库中最新的交易日期
     latest_date_in_db = get_latest_date_in_db()
@@ -2912,14 +2911,14 @@ def main():
     print(f"市场形态判定: {market_regime}")
 
     # 🔥 新增：运行诊断
-    diagnose_stage2_filters(con, latest_date_in_db)
+    # diagnose_stage2_filters(con, latest_date_in_db)
 
     # 更新量价趋势特征表
     update_volume_trend_features(con, latest_date_in_db)
 
-    # # 4️⃣ Stage 2: SwingTrend 技术筛选
-    # print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    # # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    # 4️⃣ Stage 2: SwingTrend 技术筛选
+    print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
+    # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     print(f"Stage 2 股票数量: {len(stage2)}")
 
