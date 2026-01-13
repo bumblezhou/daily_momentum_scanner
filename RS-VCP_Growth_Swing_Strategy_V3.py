@@ -2038,59 +2038,47 @@ TREND_STRENGTH_MULTIPLIER = {
 
 def compute_trade_score(row, sector_avg_rs: pd.DataFrame) -> float:
     """
-    V3：准实盘综合评分模型（含 trend_strength）
-    - 技术结构权重 60%
-    - CANSLIM 权重 40%
-    - trend_strength 作为执行环境调制因子（乘数）
+    V3.1：线性 Alpha Trade Score（修复极端 0 / 100）
     """
 
-    # === 硬性闸门 ===
-    if not row.get("allow_trade", False):
-        return 0.0
+    allow_trade = row.get("allow_trade", False)
 
     # === 技术结构 ===
     obv_score = OBV_SCORE_MAP.get(
         row.get("obv_ad_interpretation"), 0.5
     )
-    rs_score = min(row.get("rs_rank", 50) / 100.0, 1.0)
+
+    rs_raw = min(row.get("rs_rank", 50) / 100.0, 1.0)
+    rs_score = rs_raw ** 1.3
 
     technical_score = obv_score * 0.6 + rs_score * 0.4
 
     # === 基本面 ===
     canslim_score = min(row.get("canslim_score", 0) / 5.0, 1.0)
-
     base_score = technical_score * 0.6 + canslim_score * 0.4
 
-    # === 趋势环境调制（核心新增） ===
+    # === 趋势偏置（替代乘数） ===
+    trend_bias_map = {
+        "strong_uptrend": 0.08,
+        "uptrend": 0.05,
+        "trend_pullback": 0.02,
+        "range": -0.05,
+        "downtrend": -0.15,
+    }
     trend_strength = row.get("trend_strength", "unknown")
-    trend_multiplier = TREND_STRENGTH_MULTIPLIER.get(
-        trend_strength, 0.8
-    )
+    base_score += trend_bias_map.get(trend_strength, 0.0)
 
-    base_score *= trend_multiplier
-
-    # === 行业加成 ===
-    sector_rs = sector_avg_rs.get(row.get("sector"), 50.0)
-
-    if sector_rs > 75:
-        sector_bonus = 0.12
-    elif sector_rs > 65:
-        sector_bonus = 0.06
-    elif sector_rs < 50:
-        sector_bonus = -0.08
-    else:
-        sector_bonus = 0.0
-
-    final_score = base_score + sector_bonus
-
-    # === 期权情绪调制 ===
+    # === 期权情绪（保留，但限制放大） ===
     option_mult = option_sentiment_multiplier(row)
-    final_score *= option_mult
+    option_mult = min(option_mult, 1.1)
+    base_score *= option_mult
 
-    return round(
-        max(0.0, min(final_score * 100, 100.0)),
-        2
-    )
+    # === allow_trade 软惩罚 ===
+    if not allow_trade:
+        base_score *= 0.6
+
+    final_score = max(0.0, min(base_score * 100, 100.0))
+    return round(final_score, 2)
 
 # =========================
 # V3.1 修改：期权风险保险丝（结构化 UOA）
