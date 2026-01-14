@@ -83,7 +83,10 @@ def init_db():
             ad_slope_20 DOUBLE,
             ad_slope_5 DOUBLE,
             vol20 DOUBLE,
-            vol_rs DOUBLE
+            vol_rs DOUBLE,
+            vol50 DOUBLE,
+            vol_rs_vcp DOUBLE,
+            price_tightness DOUBLE
         )
     """);
     con.close()
@@ -498,7 +501,7 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
                 /* ===== 5. 成交量底线 =====
                 只排除流动性明显不足的股票
                 */
-                AND v.vol20 > 300000
+                AND vt.vol20 > 300000
 
                 /* ===== 6. 市值过滤 =====
                 多头市允许中等市值参与趋势扩散
@@ -549,7 +552,7 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
                 /* ===== 5. 成交量要求（提高） =====
                 防止震荡市中被流动性杀伤
                 */
-                AND v.vol20 > 700000
+                AND vt.vol20 > 700000
 
                 /* ===== 6. 市值过滤（提高） =====
                 只做抗风险能力更强的中大盘股
@@ -727,38 +730,6 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
         FROM stock_price
     ),
 
-    /* ===== 成交量确认 ===== */
-    volume_check AS (
-        SELECT
-            stock_code,
-            trade_date,
-            volume,
-            AVG(volume) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS 19 PRECEDING  -- 修改为20日均量
-            ) AS vol20,
-            AVG(volume) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS 49 PRECEDING
-            ) AS vol50
-        FROM stock_price
-    ),
-
-    /* ===== 前5日最高价 ===== */
-    prev_high AS (
-        SELECT
-            stock_code,
-            trade_date,
-            MAX(high) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
-            ) AS high_5d
-        FROM stock_price
-    ),
-
     latest_fundamentals AS (
         SELECT *
         FROM (
@@ -778,6 +749,7 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
         b.stock_code,
         b.trade_date,
         b.close,
+        b.volume,
         b.sector,
         r.rs_rank,
         b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
@@ -786,8 +758,6 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
         a.atr_slope,
         r.rs_20, r.rs_20_10days_ago,
         p.pivot_price,
-        v.volume, v.vol20, v.vol50,
-        ph.high_5d,
         vt.obv,
         vt.obv_ma20,
         vt.obv_slope_20,
@@ -797,6 +767,9 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
         vt.ad_slope_5,
         vt.vol20,
         vt.vol_rs,
+        vt.vol50,
+        vt.vol_rs_vcp,
+        vt.price_tightness,
         f.canslim_score,
         f.quarterly_eps_growth,
         f.annual_eps_growth,
@@ -814,8 +787,6 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
     JOIN rs_ranked r USING (stock_code, trade_date)
     JOIN atr_stats a USING (stock_code, trade_date)
     JOIN pivot_data p USING (stock_code, trade_date)
-    JOIN volume_check v USING (stock_code, trade_date)
-    JOIN prev_high ph USING (stock_code, trade_date)
     LEFT JOIN stock_volume_trend vt
         ON b.stock_code = vt.stock_code
         AND b.trade_date = vt.trade_date
@@ -878,7 +849,7 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
                 AND a.atr15 <= a.atr60 * 1.05
                 
                 /* ===== 5. 成交量（标准）===== */
-                AND v.vol20 > 100000
+                AND vt.vol20 > 100000
             )
         """
     else:
@@ -894,7 +865,7 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
                 AND r.rs_20 > r.rs_20_10days_ago
                 AND (a.atr5 / NULLIF(a.atr20, 0)) < 0.95
                 AND a.atr15 < a.atr60
-                AND v.vol20 > 300000
+                AND vt.vol20 > 300000
             )
         """
     
@@ -1038,36 +1009,6 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
         FROM stock_price
     ),
 
-    volume_check AS (
-        SELECT
-            stock_code,
-            trade_date,
-            volume,
-            AVG(volume) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS 19 PRECEDING
-            ) AS vol20,
-            AVG(volume) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS 49 PRECEDING
-            ) AS vol50
-        FROM stock_price
-    ),
-
-    prev_high AS (
-        SELECT
-            stock_code,
-            trade_date,
-            MAX(high) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
-                ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
-            ) AS high_5d
-        FROM stock_price
-    ),
-
     latest_fundamentals AS (
         SELECT *
         FROM (
@@ -1087,6 +1028,7 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
         b.stock_code,
         b.trade_date,
         b.close,
+        b.volume,
         b.sector,
         r.rs_rank,
         b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
@@ -1095,8 +1037,6 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
         a.atr_slope,
         r.rs_20, r.rs_20_10days_ago,
         p.pivot_price,
-        v.volume, v.vol20, v.vol50,
-        ph.high_5d,
         vt.obv,
         vt.obv_ma20,
         vt.obv_slope_20,
@@ -1106,6 +1046,9 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
         vt.ad_slope_5,
         vt.vol20,
         vt.vol_rs,
+        vt.vol50,
+        vt.vol_rs_vcp,
+        vt.price_tightness,
         f.canslim_score,
         f.quarterly_eps_growth,
         f.annual_eps_growth,
@@ -1123,8 +1066,6 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
     JOIN rs_ranked r USING (stock_code, trade_date)
     JOIN atr_stats a USING (stock_code, trade_date)
     JOIN pivot_data p USING (stock_code, trade_date)
-    JOIN volume_check v USING (stock_code, trade_date)
-    JOIN prev_high ph USING (stock_code, trade_date)
     LEFT JOIN stock_volume_trend vt
         ON b.stock_code = vt.stock_code
         AND b.trade_date = vt.trade_date
@@ -1769,7 +1710,15 @@ def update_volume_trend_features(con, latest_trading_day: str):
             (ad - LAG(ad, 20) OVER (PARTITION BY stock_code ORDER BY trade_date)) / NULLIF(avg_vol_20 * 20, 0) AS ad_slope_20,
             (ad - LAG(ad, 5) OVER (PARTITION BY stock_code ORDER BY trade_date)) / NULLIF(avg_vol_20 * 5, 0) AS ad_slope_5,
             AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING) AS vol20,
-            volume / NULLIF(AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING), 0) AS vol_rs
+            volume / NULLIF(AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 19 PRECEDING), 0) AS vol_rs,
+            AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 49 PRECEDING) AS vol50,
+            -- 5日均量 / 60日均量 (这能完美识别缩量干涸)
+            (AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 4 PRECEDING)) / 
+            (NULLIF(AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 59 PRECEDING), 0)) as vol_rs_vcp,
+            
+            -- 计算紧致度 (Price Tightness)
+            (MAX(high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 4 PRECEDING) - 
+            MIN(low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 4 PRECEDING)) / NULLIF(close, 0) as price_tightness
         FROM obv_ad
     )
 
@@ -1791,18 +1740,38 @@ def classify_obv_ad_enhanced(
     ad_s20,
     obv_s5,
     ad_s5,
+    vol_rs_vcp,       # 5d/60d 缩量比
+    raw_price_tightness,   # 5d 波幅占比
     market_regime="多头"
 ):
+    # 阈值定义
     STRONG = 0.1 # 只要平均每日净流入达到日均成交量的 10% 就算强
     WEAK = 0.02
+    
+    price_tightness = 1.0 # 默认不紧致
+    try:
+        # 如果是字符串 '0.00124'，转为 float；如果转换失败或为 None，默认 1.0 (不紧致)
+        price_tightness = float(raw_price_tightness) if raw_price_tightness is not None else 1.0
+    except (ValueError, TypeError):
+        price_tightness = 1.0
 
-    # 1️⃣ 明确吸筹
+    # --- 1️⃣ 核心新增：VCP 极度缩量（隐蔽吸筹 - WWD型） ---
+    # 逻辑：价格波幅极其紧致（<4%）且成交量极度萎缩（比均量少30%以上）
+    if price_tightness < 0.045 and vol_rs_vcp < 0.75:
+        return "极度缩量(隐蔽吸筹)"
+
+    # --- 2️⃣ 明确吸筹 (主动进攻型) ---
     if obv_s20 > STRONG and ad_s20 > STRONG:
         if obv_s5 > 0:
             return "明确吸筹"
         return "强趋势回撤"
 
-    # 2️⃣ 趋势中资金分歧
+    # --- 3️⃣ 高位放量震荡 (WS预警型) ---
+    # 逻辑：如果成交量很大(vol_rs_vcp > 1.2)，但价格波幅很大(>8%)，说明分歧严重
+    if vol_rs_vcp > 1.2 and price_tightness > 0.08:
+        return "高位放量分歧"
+
+    # --- 4️⃣ 其他原逻辑 ---
     if obv_s20 > WEAK and ad_s20 < -WEAK:
         if market_regime == "多头":
             return "趋势中资金分歧"
@@ -2013,12 +1982,14 @@ def compute_trend_strength_from_row(
 OBV_SCORE_MAP = {
     # === 主动进攻型 ===
     "明确吸筹": 1.00,          # 最理想：趋势 + 资金 + 共振
+    "极度缩量(隐蔽吸筹)": 0.98,   # 这种形态通常是爆发前夜，极具价值
     # === 趋势中健康结构 ===
     "强趋势回撤": 0.85,        # 上升趋势中的洗盘，极高价值
     "底部试探": 0.75,          # 早期资金介入，允许小仓位
     # === 中性 / 观察区 ===
     "量价中性": 0.60,          # 盘整期，留在雷达内
     "趋势中资金分歧": 0.50,    # 内外资分歧，需等待确认
+    "高位放量分歧": 0.35,        # 调低分数，规避类似 WS 的假信号
     # === 风险预警区 ===
     "控盘减弱预警": 0.30,      # 不宜新开仓，防止诱多
     # === 明确回避 ===
@@ -2036,22 +2007,40 @@ TREND_STRENGTH_MULTIPLIER = {
 }
 
 
-def compute_trade_score(row, sector_avg_rs: pd.DataFrame) -> float:
+def compute_trade_score(row, sector_avg_rs: dict) -> float:
     """
     V3.1：线性 Alpha Trade Score（修复极端 0 / 100）
+    集成了 VCP 紧致度奖励与板块风险过滤
     """
 
     allow_trade = row.get("allow_trade", False)
 
     # === 技术结构 ===
+    # 从 OBV_SCORE_MAP 获取基础分
     obv_score = OBV_SCORE_MAP.get(
         row.get("obv_ad_interpretation"), 0.5
     )
 
+    # 逻辑增强：引入 VCP 临门一脚的“价格紧致度”奖励
+    # 股价 5 日波幅越小，筹码锁定越好，赋予额外技术加分
+    tightness = 1.0 # 默认不紧致
+    raw_tightness = row.get("price_tightness")
+    try:
+        # 如果是字符串 '0.00124'，转为 float；如果转换失败或为 None，默认 1.0 (不紧致)
+        tightness = float(raw_tightness) if raw_tightness is not None else 1.0
+    except (ValueError, TypeError):
+        tightness = 1.0
+    tightness_bonus = 0.0
+    if tightness < 0.045:  # VCP 标准：5日内波幅小于 4.5%
+        tightness_bonus = 0.08
+    elif tightness < 0.07: # 次优紧致度
+        tightness_bonus = 0.03
+
     rs_raw = min(row.get("rs_rank", 50) / 100.0, 1.0)
     rs_score = rs_raw ** 1.3
 
-    technical_score = obv_score * 0.6 + rs_score * 0.4
+    # 综合技术分：OBV + RS + 紧致度奖励
+    technical_score = (obv_score + tightness_bonus) * 0.6 + rs_score * 0.4
 
     # === 基本面 ===
     canslim_score = min(row.get("canslim_score", 0) / 5.0, 1.0)
@@ -2067,6 +2056,21 @@ def compute_trade_score(row, sector_avg_rs: pd.DataFrame) -> float:
     }
     trend_strength = row.get("trend_strength", "unknown")
     base_score += trend_bias_map.get(trend_strength, 0.0)
+
+    # === 板块强度过滤 (解决 WS 假信号关键) ===
+    # 利用传入的 sector_avg_rs 字典进行比对
+    stock_sector = row.get("sector")
+    avg_sector_rs = sector_avg_rs.get(stock_sector, 50.0)
+    
+    sector_multiplier = 1.0
+    # 逻辑：如果个股 RS 远高于行业平均，说明是领头羊（加分）
+    # 如果行业平均 RS 低于 55，说明板块整体走弱，个股容易被拖累（减分）
+    if avg_sector_rs < 55.0:
+        sector_multiplier = 0.85  # 板块平庸，得分打 85 折
+    elif avg_sector_rs > 75.0:
+        sector_multiplier = 1.05  # 板块强势，得分加成 5%
+
+    base_score *= sector_multiplier
 
     # === 期权情绪（保留，但限制放大） ===
     option_mult = option_sentiment_multiplier(row)
@@ -2969,7 +2973,7 @@ def main():
     # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
     final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
 
-    for col in ["obv_slope_20", "obv_slope_5", "ad_slope_20", "ad_slope_5"]:
+    for col in ["obv_slope_20", "obv_slope_5", "ad_slope_20", "ad_slope_5", "vol_rs_vcp", "price_tightness"]:
         final_with_sim[col] = final_with_sim[col].fillna(0.0)
     # 量价趋势特征解读
     final_with_sim['obv_ad_interpretation'] = final_with_sim.apply(
@@ -2978,6 +2982,8 @@ def main():
             row.get('ad_slope_20'),
             row.get('obv_slope_5'),
             row.get('ad_slope_5'),
+            row.get('vol_rs_vcp'),
+            row.get('price_tightness'),
             market_regime=market_regime if 'market_regime' in globals() else None
         ),
         axis=1
