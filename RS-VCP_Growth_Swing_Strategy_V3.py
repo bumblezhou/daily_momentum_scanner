@@ -2944,10 +2944,140 @@ def apply_entry_stop_target_vix(
 
     return df
 
+# TrendStage 四分类（硬规则）
+# early          → 趋势刚启动
+# mid            → 主升浪可交易段
+# late           → 趋势后段，风险上升
+# distribution   → 派发 / 高位结构破坏
+def classify_trend_stage(row) -> str:
+    """
+    基于 trend_strength 的趋势生命周期判定
+    只依赖 pf / final_with_sim 中已存在的截面字段
+
+    返回：
+        'early' | 'mid' | 'late' | 'distribution' | 'unknown'
+    """
+
+    try:
+        # ======================================================
+        # 1. 趋势主状态（唯一权威来源）
+        # ======================================================
+        trend_strength = row.get("trend_strength")
+
+        if trend_strength not in {
+            "strong_uptrend",
+            "uptrend",
+            "trend_pullback",
+            "range",
+            "downtrend",
+        }:
+            return "unknown"
+
+        # ======================================================
+        # 2. 基础价格与指标（截面）
+        # ======================================================
+        close = row.get("close")
+        ma20 = row.get("ma20")
+        ma50 = row.get("ma50")
+        ma200 = row.get("ma200")
+
+        high_52w = row.get("high_52w")
+        atr_15 = row.get("atr_15")
+
+        rs_rank = row.get("rs_rank")
+        obv_slope_20 = row.get("obv_slope_20")
+
+        if close is None or close <= 0:
+            return "unknown"
+
+        # ======================================================
+        # 3. 派生比例（只用截面可算的）
+        # ======================================================
+        dist_to_52w_high = (
+            (high_52w - close) / high_52w
+            if high_52w and high_52w > 0
+            else None
+        )
+
+        ma20_dist = (
+            (close - ma20) / ma20
+            if ma20 and ma20 > 0
+            else None
+        )
+
+        atr_ratio = (
+            atr_15 / close
+            if atr_15 and atr_15 > 0
+            else None
+        )
+
+        # ======================================================
+        # 4️⃣ distribution（结构性风险，优先级最高）
+        # ======================================================
+        distribution_conditions = 0
+
+        if ma50 and close < ma50:
+            distribution_conditions += 1
+
+        if obv_slope_20 is not None and obv_slope_20 < 0:
+            distribution_conditions += 1
+
+        if rs_rank is not None and rs_rank < 50:
+            distribution_conditions += 1
+
+        if trend_strength in {"range", "downtrend"}:
+            distribution_conditions += 1
+
+        if distribution_conditions >= 2:
+            return "distribution"
+
+        # ======================================================
+        # 5️⃣ late stage（强趋势后段：位置 + 乖离 + 波动）
+        # ======================================================
+        if (
+            trend_strength == "strong_uptrend"
+            and dist_to_52w_high is not None
+            and dist_to_52w_high < 0.03
+            and ma20_dist is not None
+            and ma20_dist > 0.06
+            and atr_ratio is not None
+            and atr_ratio > 0.03
+        ):
+            return "late"
+
+        # ======================================================
+        # 6️⃣ mid stage（主升浪：最优 Swing 区）
+        # ======================================================
+        if (
+            trend_strength == "strong_uptrend"
+            and dist_to_52w_high is not None
+            and 0.03 <= dist_to_52w_high <= 0.20
+            and ma20_dist is not None
+            and 0.01 <= ma20_dist <= 0.05
+        ):
+            return "mid"
+
+        # ======================================================
+        # 7️⃣ early stage（趋势初期）
+        # ======================================================
+        if (
+            trend_strength in {"uptrend", "trend_pullback"}
+            and dist_to_52w_high is not None
+            and dist_to_52w_high > 0.20
+            and ma50 and close > ma50
+            and ma200 and close > ma200
+        ):
+            return "early"
+
+        return "unknown"
+
+    except Exception:
+        return "unknown"
+
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "NVDA", "AMD", "ORCL", "CDE", "BABA"]
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "ORLA", "RVLV", "WS"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -3134,6 +3264,12 @@ def main():
         OPTION_STATE_CN_MAP
     )
 
+    # 计算趋势生命周期阶段
+    final_with_sim["trend_stage"] = final_with_sim.apply(
+        lambda row: classify_trend_stage(row),
+        axis=1
+    )
+
     # =========================
     # V3：生成最终交易评分
     # =========================
@@ -3168,7 +3304,7 @@ def main():
         "revenue_growth", "roe", "shares_outstanding", 
         "inst_ownership", "fcf_quality", "market_cap", 'sector', 
         'trade_state', 'trade_score', 'obv_ad_interpretation', 
-        'trend_strength','option_state_cn'
+        'trend_strength', 'trend_stage', 'option_state_cn'
     ]
     print(final_with_sim[display_cols].to_string(index=False))
 
