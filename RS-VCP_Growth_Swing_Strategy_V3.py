@@ -1,9 +1,7 @@
-from functools import partial
 import requests
 import pandas as pd
 import duckdb
 import yfinance as yf
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import urllib3
@@ -2818,6 +2816,112 @@ def build_price_history_map(
     return price_history_map
 
 
+def get_vwap_and_premarket_high(ticker, target_date):
+    import yfinance as yf
+    import pandas as pd
+    import pytz
+    from datetime import datetime, timedelta, date
+
+    try:
+        # ---- normalize date ----
+        if isinstance(target_date, str):
+            target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+        elif isinstance(target_date, datetime):
+            target_date = target_date.date()
+        elif not isinstance(target_date, date):
+            raise ValueError("Invalid target_date")
+
+        # ---- fetch data ----
+        df = yf.download(
+            ticker,
+            start=target_date,
+            end=target_date + timedelta(days=1),
+            interval="1m",
+            prepost=True,
+            progress=False,
+            threads=False
+        )
+
+        if df.empty:
+            return None, None
+
+        # ---- FIX: correct MultiIndex flatten ----
+        if isinstance(df.columns, pd.MultiIndex):
+            # level 0 = OHLCV, level 1 = ticker
+            df.columns = df.columns.get_level_values(0)
+
+        # ---- normalize columns ----
+        df.columns = [c.lower() for c in df.columns]
+
+        # ---- timezone ----
+        et = pytz.timezone("America/New_York")
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(et)
+        else:
+            df.index = df.index.tz_convert(et)
+
+        # ---- time windows ----
+        base = datetime.combine(target_date, datetime.min.time())
+        regular_start = et.localize(base.replace(hour=9, minute=30))
+        regular_end   = et.localize(base.replace(hour=16, minute=0))
+        premarket_start = et.localize(base.replace(hour=4, minute=0))
+
+        regular = df[(df.index >= regular_start) & (df.index < regular_end)]
+        premarket = df[(df.index >= premarket_start) & (df.index < regular_start)]
+
+        # ---- VWAP ----
+        vwap = None
+        if not regular.empty and regular["volume"].sum() > 0:
+            typical_price = (
+                regular["high"] + regular["low"] + regular["close"]
+            ) / 3
+            vwap = (typical_price * regular["volume"]).sum() / regular["volume"].sum()
+
+        # ---- Premarket High ----
+        premarket_high = (
+            premarket["high"].max()
+            if not premarket.empty
+            else None
+        )
+
+        return (
+            float(vwap) if vwap is not None else None,
+            float(premarket_high) if premarket_high is not None else None
+        )
+
+    except Exception as e:
+        print(f"[获取VWAP数据失败] {ticker}: {e}")
+        return None, None
+
+
+def integrate_vwap_and_premarket(final_with_sim, latest_date_in_db):
+    """
+    集成 VWAP 和盘前高点到 final_with_sim DataFrame
+    """
+    # Assuming final_with_sim is your pf (processed DataFrame)
+    # Get unique tickers (use 'stock_code' column)
+    tickers = final_with_sim['stock_code'].unique().tolist()
+
+    # Batch fetch (max_workers=5 to avoid yf rate limits)
+    vwap_dict = {}
+    premarket_high_dict = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_ticker = {executor.submit(get_vwap_and_premarket_high, ticker, latest_date_in_db): ticker
+                            for ticker in tickers}
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                vwap, pm_high = future.result()
+                vwap_dict[ticker] = vwap
+                premarket_high_dict[ticker] = pm_high
+            except Exception as e:
+                print(f"Batch error for {ticker}: {e}")
+
+    # Map back to DataFrame
+    final_with_sim['vwap'] = final_with_sim['stock_code'].map(vwap_dict)
+    final_with_sim['premarket_high'] = final_with_sim['stock_code'].map(premarket_high_dict)
+
+
 # =========================
 # V3 新增：入场区间计算（含 VIX 调节因子）
 # =========================
@@ -3174,6 +3278,21 @@ def classify_trend_stage(row) -> str:
         return "unknown"
 
 
+def fetch_current_vix():
+    """
+    获取当前 VIX 指数值"""
+    try:
+        vix_df = yf.download("^VIX", period="1d", progress=False, proxy=PROXIES["http"])
+        # 获取最新 VIX 收盘价，若失败则取默认值 18.0
+        current_vix = vix_df['Close'].iloc[-1] if not vix_df.empty else 18.0
+        if isinstance(current_vix, pd.Series): current_vix = current_vix.iloc[0]
+        print(f"当前 VIX 指数: {current_vix:.2f} (调节系数: {max(1.0, 1+(current_vix-18)*0.05):.2f}x)")
+    except Exception as e:
+        print(f"VIX 获取失败，使用基准值: {e}")
+        current_vix = 18.0
+    return current_vix
+
+
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
 CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "ORLA", "RVLV", "WS"]
@@ -3204,6 +3323,8 @@ def main():
         min_bars=60
     )
 
+    # 更新基本面数据
+    print(f"🚀 Stage 1: 更新最新的基本面数据")
     update_fundamentals(con, get_tickers_missing_recent_fundamentals(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=False)
 
     # 🔥 新增：先检查数据完整性
@@ -3239,8 +3360,6 @@ def main():
     #     print("❌ 今日无符合技术面筛选的股票，程序结束。")
     #     return # 或者保存一个空结果
 
-    # 合并结果
-    # final = stage2.merge(stage3, on="stock_code", how="left")
     final = stage2.copy()
     # 填充缺失的基本面分数为 0，防止 query 报错
     final["canslim_score"] = final["canslim_score"].fillna(0)
@@ -3259,32 +3378,29 @@ def main():
         .query("market_cap >= 1_000_000_000 and quarterly_eps_growth.notna()")
         .sort_values(["canslim_score", "rs_rank", "is_current_hold"], ascending=False)
     )
+    print(f"按市值【10亿美元】和季度每股收益增长【quarterly_eps_growth】过滤后股票总数: {len(final_filtered)}")
+
+    # 5️⃣ 集成 VWAP 和盘前高点
+    print("\n🔍 正在获取 VWAP 和盘前高点数据...")
+    integrate_vwap_and_premarket(final_filtered, latest_date_in_db)
 
     # 6️⃣ 波动模拟 (VIX 调节)
     print("\n🔍 正在获取市场 VIX 数据以调节波动区间...")
-    try:
-        vix_df = yf.download("^VIX", period="1d", progress=False, proxy=PROXIES["http"])
-        # 获取最新 VIX 收盘价，若失败则取默认值 18.0
-        current_vix = vix_df['Close'].iloc[-1] if not vix_df.empty else 18.0
-        if isinstance(current_vix, pd.Series): current_vix = current_vix.iloc[0]
-        print(f"当前 VIX 指数: {current_vix:.2f} (调节系数: {max(1.0, 1+(current_vix-18)*0.05):.2f}x)")
-    except Exception as e:
-        print(f"VIX 获取失败，使用基准值: {e}")
-        current_vix = 18.0
-
+    current_vix = fetch_current_vix()
+    
     # 注入回撤模拟数据
     # 注入 VIX-aware Entry / Stop / Target
     print("🛠️ 注入 VIX-aware Entry / Stop / Target ...")
-    final_filtered = apply_entry_stop_target_vix(
+    final_with_sim = apply_entry_stop_target_vix(
         final_filtered,
         current_vix=current_vix
     )
+
+    final_with_sim = final_with_sim.query("entry_price.notna()")
+    print(f"按必须包含买入价【entry_price】过滤后股票总数: {len(final_with_sim)}")
     
     # 关闭连接
     con.close()
-    
-    # 合并模拟结果
-    final_with_sim = final_filtered
 
     # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
     final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
