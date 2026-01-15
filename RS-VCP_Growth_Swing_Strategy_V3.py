@@ -2826,43 +2826,51 @@ def calculate_entry_zone_vix(
     vwap: float | None,
     atr: float | None,
     premarket_high: float | None,
-    high_5d: float | None,    # 技术位：5日高点
+    high_5d: float | None,
     trend_strength: str,
     current_vix: float
 ) -> tuple[str, float]:
-
     if atr is None or atr <= 0:
-        atr = close * 0.03
+        atr = close * 0.03  # 默认波动
 
     vix_mult = get_vix_multiplier(current_vix)
-    adj_atr = atr * vix_mult
+    adj_atr = atr * vix_mult  # VIX 调节波动宽度
 
-    # --- 确定基准突破位 (Pivot) ---
-    pivot = max(
-        high_5d if high_5d else close,
-        premarket_high if premarket_high else 0,
-        close
-    )
+    # 改进 base：优先 vwap，其次 close
+    base = vwap if vwap else close
 
-    if trend_strength in ("strong_uptrend", "uptrend"):
-        # 1. 执行价 (entry_price)：基于压力位微幅向上偏移，确保有效突破
-        # 这里不宜用 adj_atr，因为突破确认通常是极小的点位确认
-        entry_price = pivot * 1.002 
-        
-        # 2. 介入区间 (entry_low / entry_high)：
-        # 这里重新引入 adj_atr。如果市场波动剧烈，买入区间会自动变宽
+    # 改进 pivot：不再总是取 max high_5d，避免偏高；用加权平均（70% base + 30% high_5d）
+    effective_high = high_5d if high_5d else base
+    pivot = 0.7 * base + 0.3 * effective_high  # 中性化，减少偏高
+
+    if premarket_high:
+        pivot = max(pivot, premarket_high)  # 只在有 premarket 时覆盖
+
+    # 根据 trend_strength 区分偏移
+    if trend_strength == "strong_uptrend":
+        # 突破型：区间略向上偏移，entry_price 取上限（追小涨）
         entry_low = pivot
-        entry_high = pivot + (adj_atr * 0.4) # 使用 adj_atr 动态决定追涨上限
+        entry_high = pivot + (adj_atr * 0.5)  # 放大到 0.5 以覆盖更多
+        entry_price = entry_high  # 建议在上限执行（突破确认）
+    elif trend_strength == "uptrend":
+        # 中性：区间对称，entry_price 取中点
+        entry_low = pivot - (adj_atr * 0.3)
+        entry_high = pivot + (adj_atr * 0.3)
+        entry_price = pivot  # 中点执行
+    elif trend_strength == "trend_pullback":
+        # 低吸型：区间向下偏移，entry_price 取下限
+        entry_low = pivot - (adj_atr * 0.5)
+        entry_high = pivot + (adj_atr * 0.2)
+        entry_price = entry_low  # 建议在下限执行（回撤买入）
     else:
-        # 非强趋势下，沿用你原有的基准逻辑
-        base = vwap if vwap else close
-        entry_low = base - (adj_atr * 0.5)
+        # 其他：保守，窄区间，中点执行
+        entry_low = base - (adj_atr * 0.2)
         entry_high = base + (adj_atr * 0.2)
-        entry_price = entry_high
+        entry_price = base
 
-    # 最后一道防线：防止区间因极端数据产生逻辑崩坏
-    entry_low = max(entry_low, close * 0.96)
-    entry_high = min(entry_high, close * 1.05)
+    # 极端保护：防止偏离 close 太多
+    entry_low = max(entry_low, close * 0.97)  # 不低于 close -3%
+    entry_high = min(entry_high, close * 1.03)  # 不高于 close +3%
     entry_price = max(min(entry_price, entry_high), entry_low)
 
     return f"{entry_low:.2f} - {entry_high:.2f}", round(entry_price, 2)
