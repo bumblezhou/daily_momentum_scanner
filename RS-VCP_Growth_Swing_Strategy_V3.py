@@ -255,7 +255,7 @@ def get_recent_trading_days_smart(n=10):
 
 
 # 找出「最近交易日有缺失行情」的 ticker
-def get_tickers_missing_recent_data(trading_days):
+def get_tickers_missing_recent_price(trading_days):
     """
     返回尚未更新到最近一个交易日的 ticker 列表
     """
@@ -281,6 +281,40 @@ def get_tickers_missing_recent_data(trading_days):
             AND (
                 p.last_trade_date IS NULL
                 OR p.last_trade_date < DATE '{latest_trading_day}'
+            )
+    """
+
+    tickers = [r[0] for r in con.execute(query).fetchall()]
+    con.close()
+    return tickers
+
+
+def get_tickers_missing_recent_fundamentals(trading_days):
+    """
+    返回尚未更新到最近一个交易日的 ticker 列表
+    """
+    latest_trading_day = trading_days[-1]
+
+    con = duckdb.connect(DUCKDB_PATH)
+
+    query = f"""
+        SELECT t.symbol
+        FROM stock_ticker t
+        LEFT JOIN  (
+            SELECT
+                stock_code,
+                MAX(update_date) AS last_update_date
+            FROM stock_fundamentals
+            GROUP BY stock_code
+        ) f
+        ON f.stock_code = t.symbol
+        WHERE
+            t.type = 'Common Stock'
+            AND t.mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
+            AND COALESCE(t.yf_price_available, TRUE) = TRUE
+            AND (
+                f.last_update_date IS NULL
+                OR f.last_update_date < DATE '{latest_trading_day}'
             )
     """
 
@@ -368,7 +402,7 @@ def update_recent_prices(watchlist: list = []):
 
     target_date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
 
-    raw_tickers = get_tickers_missing_recent_data(trading_days)
+    raw_tickers = get_tickers_missing_recent_price(trading_days)
     if not raw_tickers and not watchlist:
         print(f"✅ 数据库已是最新，跳过更新")
         return
@@ -591,11 +625,17 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
             /* ===== 52 周高低点窗口（252 日） ===== */
             MAX(p.high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
             MIN(p.low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
+            /* ===== 5 天高低点窗口 ===== */
+            -- 计算过去 5 个交易日（含今天）的最高价
+            MAX(p.high) OVER w5 AS high_5d,
+            -- 计算过去 5 个交易日（含今天）的最低价
+            MIN(p.low) OVER w5 AS low_5d,
 
             COUNT(*) OVER w_all AS trading_days
         FROM stock_price p
         LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
         WINDOW
+            w5  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 4 PRECEDING),
             w10  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 9 PRECEDING),
             w20  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 19 PRECEDING),
             w50  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 49 PRECEDING),
@@ -753,7 +793,7 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
         b.sector,
         r.rs_rank,
         b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
-        b.high_52w, b.low_52w,
+        b.high_52w, b.low_52w, b.high_5d, b.low_5d,
         a.atr5, a.atr20, a.atr15, a.atr60, a.atr10, a.atr50,
         a.atr_slope,
         r.rs_20, r.rs_20_10days_ago,
@@ -880,17 +920,26 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
             p.low,
             p.volume,
             t.sector,
-            AVG(p.close) OVER w10  AS ma10,
-            AVG(p.close) OVER w20  AS ma20,
+            /* ===== 均线参数（可调） ===== */
+            AVG(p.close) OVER w10  AS ma10,    -- 短线持仓用
+            AVG(p.close) OVER w20  AS ma20,    -- 新增：用于止损和VCP
             AVG(p.close) OVER w50  AS ma50,
             AVG(p.close) OVER w150 AS ma150,
             AVG(p.close) OVER w200 AS ma200,
-            MAX(p.high) OVER w252 AS high_52w,
-            MIN(p.low) OVER w252 AS low_52w,
+            /* ===== 52 周高低点窗口（252 日） ===== */
+            MAX(p.high) OVER w252 AS high_52w,  -- 修正：实战中多用 high
+            MIN(p.low) OVER w252 AS low_52w,    -- 修正：实战中多用 low
+            /* ===== 5 天高低点窗口 ===== */
+            -- 计算过去 5 个交易日（含今天）的最高价
+            MAX(p.high) OVER w5 AS high_5d,
+            -- 计算过去 5 个交易日（含今天）的最低价
+            MIN(p.low) OVER w5 AS low_5d,
+
             COUNT(*) OVER w_all AS trading_days
         FROM stock_price p
         LEFT JOIN stock_ticker t ON p.stock_code = t.symbol
         WINDOW
+            w5  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 4 PRECEDING),
             w10  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 9 PRECEDING),
             w20  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 19 PRECEDING),
             w50  AS (PARTITION BY p.stock_code ORDER BY p.trade_date ROWS 49 PRECEDING),
@@ -1032,7 +1081,7 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
         b.sector,
         r.rs_rank,
         b.ma10, b.ma20, b.ma50, b.ma150, b.ma200,
-        b.high_52w, b.low_52w,
+        b.high_52w, b.low_52w, b.high_5d, b.low_5d,
         a.atr5, a.atr20, a.atr15, a.atr60, a.atr10, a.atr50,
         a.atr_slope,
         r.rs_20, r.rs_20_10days_ago,
@@ -1387,9 +1436,12 @@ def update_fundamentals(con, ticker_list, force_update=False):
         print("✅ 所有基本面数据均在有效期内，无需更新。")
         return
 
+    update_count = 1
     print(f"🚀 开始更新 {len(need_update)} 只股票的基本面...")
     for symbol in need_update:
         try:
+            if update_count % YF_BATCH_SIZE == 0:
+                print(f"  [{update_count}/{len(need_update)}] 更新 {symbol} ... ")
             t = yf.Ticker(finnhub_to_yahoo(symbol))
             info = t.info
 
@@ -1483,6 +1535,7 @@ def update_fundamentals(con, ticker_list, force_update=False):
                   opt_uoa_avg_dte,
                   opt_uoa_type)
             )
+            update_count += 1
 
         except Exception as e:
             print(f"  [ERR] {symbol} 更新失败: {e}")
@@ -2305,7 +2358,7 @@ def check_data_integrity(con):
     print(f"\n⚠️  被标记为yf不可用的股票: {unavailable_count}")
     
     # 5. 检查基本面数据
-    fundamental_count = con.execute("SELECT COUNT(*) FROM stock_fundamentals").fetchone()[0]
+    fundamental_count = con.execute("SELECT COUNT(DISTINCT(stock_code)) FROM stock_fundamentals").fetchone()[0]
     print(f"📊 有基本面数据的股票: {fundamental_count}")
     
     # 6. 推断问题
@@ -2683,6 +2736,7 @@ def calculate_entry_zone_vix(
     vwap: float | None,
     atr: float | None,
     premarket_high: float | None,
+    high_5d: float | None,    # 技术位：5日高点
     trend_strength: str,
     current_vix: float
 ) -> tuple[str, float]:
@@ -2693,23 +2747,35 @@ def calculate_entry_zone_vix(
     vix_mult = get_vix_multiplier(current_vix)
     adj_atr = atr * vix_mult
 
+    # --- 确定基准突破位 (Pivot) ---
+    pivot = max(
+        high_5d if high_5d else close,
+        premarket_high if premarket_high else 0,
+        close
+    )
+
     if trend_strength in ("strong_uptrend", "uptrend"):
-        base = max(
-            close * 0.995,
-            vwap if vwap else 0,
-            premarket_high if premarket_high else 0
-        )
-        entry_low = base
-        entry_high = base + adj_atr * 0.3
+        # 1. 执行价 (entry_price)：基于压力位微幅向上偏移，确保有效突破
+        # 这里不宜用 adj_atr，因为突破确认通常是极小的点位确认
+        entry_price = pivot * 1.002 
+        
+        # 2. 介入区间 (entry_low / entry_high)：
+        # 这里重新引入 adj_atr。如果市场波动剧烈，买入区间会自动变宽
+        entry_low = pivot
+        entry_high = pivot + (adj_atr * 0.4) # 使用 adj_atr 动态决定追涨上限
     else:
+        # 非强趋势下，沿用你原有的基准逻辑
         base = vwap if vwap else close
-        entry_low = base - adj_atr * 0.5
-        entry_high = base + adj_atr * 0.2
+        entry_low = base - (adj_atr * 0.5)
+        entry_high = base + (adj_atr * 0.2)
+        entry_price = entry_high
 
+    # 最后一道防线：防止区间因极端数据产生逻辑崩坏
     entry_low = max(entry_low, close * 0.96)
-    entry_high = min(entry_high, close * 1.04)
+    entry_high = min(entry_high, close * 1.05)
+    entry_price = max(min(entry_price, entry_high), entry_low)
 
-    return f"{entry_low:.2f} - {entry_high:.2f}", round(entry_high, 2)
+    return f"{entry_low:.2f} - {entry_high:.2f}", round(entry_price, 2)
 
 
 # =========================
@@ -2718,46 +2784,68 @@ def calculate_entry_zone_vix(
 def calculate_hard_stop_vix(
     entry_price: float,
     atr: float | None,
+    low_5d: float | None,     # 新增参数：5日最低价，作为技术支撑位
     current_vix: float
 ) -> float:
-
+    """
+    修改逻辑：将止损从“固定点数”改为“技术位支撑 + 波动保护”
+    """
     if atr is None or atr <= 0:
         atr = entry_price * 0.03
 
     vix_mult = get_vix_multiplier(current_vix)
-    stop = entry_price - atr * 1.2 * vix_mult
+    
+    # 1. 基于 ATR 的动态止损 (通常在 1.5 到 2 倍 ATR 之间)
+    # VIX 越高，乘数越大，给波动留出呼吸空间
+    atr_stop = entry_price - (atr * 1.5 * vix_mult)
+    
+    # 2. 基于技术结构的止损 (5日最低价下方 0.5%)
+    # 逻辑：如果跌破了过去5天的最低点，VCP 形态就彻底走坏了
+    tech_support = (low_5d * 0.995) if low_5d else (entry_price * 0.94)
+    
+    # --- 严谨取值 ---
+    # 我们选取 ATR 止损和技术支撑止损中“较近”的一个，但不能太近
+    # 保证至少有 2.5% 的空间，防止无谓震仓
+    hard_stop = min(atr_stop, tech_support)
+    
+    # 极端保护：单笔损耗限制在 entry_price 的 8% 以内（防止断崖下跌）
+    max_risk_limit = entry_price * 0.92
+    hard_stop = max(hard_stop, max_risk_limit)
 
-    return round(stop, 2)
+    return round(hard_stop, 2)
 
 
 # =========================
 # V3 新增：目标价计算（含 VIX 调节因子）
 # =========================
 def calculate_target_price_vix(
-    close: float,
+    entry_price: float,       # 由 close 改为 entry_price，更符合盈亏比逻辑
     atr: float | None,
     trend_strength: str,
     rs_rank: float,
     current_vix: float
 ) -> float:
-
     if atr is None or atr <= 0:
-        atr = close * 0.03
+        atr = entry_price * 0.03
 
     vix_mult = get_vix_multiplier(current_vix)
     adj_atr = atr * vix_mult
 
+    # 针对 RS_Rank > 90 的领头羊，使用更激进的获利预期
     if trend_strength == "strong_uptrend":
-        atr_mult = 3.0 if rs_rank > 90 else 2.5
+        # 领头羊（RS>90）给 3.5 倍 ATR 空间，普通强趋势给 2.8 倍
+        atr_mult = 3.5 if rs_rank > 90 else 2.8
     elif trend_strength == "uptrend":
-        atr_mult = 2.0
+        atr_mult = 2.2
     elif trend_strength == "trend_pullback":
-        atr_mult = 1.5
+        atr_mult = 1.8
     else:
         atr_mult = 1.2
 
-    target = close + adj_atr * atr_mult
-    return round(min(target, close * 1.35), 2)
+    target = entry_price + (adj_atr * atr_mult)
+    
+    # 实战建议：对于波段交易，25% - 35% 是一个典型的机构减仓位
+    return round(min(target, entry_price * 1.35), 2)
 
 # =========================
 # V3 新增：VIX 波动率调节因子
@@ -2800,6 +2888,8 @@ def apply_entry_stop_target_vix(
         atr = row.get("atr")
         vwap = row.get("vwap")
         premarket_high = row.get("premarket_high")
+        high_5d = row.get("high_5d")
+        low_5d = row.get("low_5d")
         trend_strength = row.get("trend_strength", "unknown")
         rs_rank = row.get("rs_rank", 0)
 
@@ -2813,6 +2903,7 @@ def apply_entry_stop_target_vix(
             vwap=vwap,
             atr=atr,
             premarket_high=premarket_high,
+            high_5d=high_5d,
             trend_strength=trend_strength,
             current_vix=current_vix
         )
@@ -2821,12 +2912,13 @@ def apply_entry_stop_target_vix(
         hard_stop = calculate_hard_stop_vix(
             entry_price=entry_price,
             atr=atr,
+            low_5d=low_5d,
             current_vix=current_vix
         )
 
         # === Target ===
         target_profit = calculate_target_price_vix(
-            close=close,
+            entry_price=entry_price,
             atr=atr,
             trend_strength=trend_strength,
             rs_rank=rs_rank,
@@ -2883,11 +2975,11 @@ def main():
         min_bars=60
     )
 
+    update_fundamentals(con, get_tickers_missing_recent_fundamentals(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=False)
+
     # 🔥 新增：先检查数据完整性
     check_data_integrity(con)
 
-    # 先更新所有基本面数据（包含监控名单）
-    update_fundamentals(con, get_tickers_missing_recent_data(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=True)
 
     # 🚀 修复点：自动获取库中最新的交易日期
     latest_date_in_db = get_latest_date_in_db()
@@ -2917,11 +3009,6 @@ def main():
     # if stage2.empty:
     #     print("❌ 今日无符合技术面筛选的股票，程序结束。")
     #     return # 或者保存一个空结果
-
-    # # 5️⃣ Stage 3: 基本面分析
-    # print("📊 Stage 3: 基本面分析")
-    # stage3 = build_stage3_fundamental_fast(con, stage2)
-    # print(f"Stage 3 股票数量: {len(stage3)}")
 
     # 合并结果
     # final = stage2.merge(stage3, on="stock_code", how="left")
