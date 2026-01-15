@@ -1787,6 +1787,17 @@ def update_volume_trend_features(con, latest_trading_day: str):
 
 # =========================
 # V3 新增：量价形势判定
+# | obv_ad_label        | 资金行为本质        | 风险等级 |
+# | ------------        | -------------      | -------- |
+# | 极度缩量(隐蔽吸筹)    | 隐蔽建仓（VCP/WWD） | 🟢 低   |
+# | 明确吸筹             | 主动进攻            | 🟢 低   |
+# | 强趋势回撤           | 洗盘 / 换手         | 🟢 低~中 |
+# | 底部试探             | 早期试水            | 🟡 中   |
+# | 趋势中资金分歧        | 多空未统一          | 🟡 中   |
+# | 量价中性             | 无信息              | 🟡 中   |
+# | 高位放量分歧          | 高位博弈            | 🔴 高   |
+# | 控盘减弱预警          | 主力松动            | 🔴 高   |
+# | 派发阶段             | 明确撤退            | 🔴 极高  |
 # =========================
 def classify_obv_ad_enhanced(
     obv_s20,
@@ -1875,31 +1886,110 @@ def classify_price_trend(
 # =========================
 # V3 修正版：量价交易资格判定（返回二元组）
 # =========================
-def obv_ad_trade_gate(obv_ad_label, trend_strength):
-    # 允许交易的趋势集合
+def obv_ad_trade_gate(
+    obv_ad_label: str,
+    trend_strength: str,
+    trend_stage: str
+):
+    """
+    基于 trend_strength + trend_stage + OBV/AD 的风险导向交易闸门
+
+    返回：
+        (allow_trade: bool, action_hint: str)
+    """
+
+    # ==================================================
+    # 1️⃣ 趋势结构前置过滤（硬条件）
+    # ==================================================
     tradable_trends = {
         "strong_uptrend",
         "uptrend",
-        "trend_pullback"
+        "trend_pullback",
     }
 
-    # 明确禁止
-    if obv_ad_label == "派发阶段":
-        return False, "禁止交易"
-
     if trend_strength not in tradable_trends:
-        return False, "仅跟踪"
+        return False, "非趋势结构，仅观察"
 
-    # === 趋势 + 量价组合 ===
-    if obv_ad_label == "明确吸筹":
-        return True, "允许建仓"
+    # ==================================================
+    # 2️⃣ 生命周期级别硬风险
+    # ==================================================
+    if trend_stage == "distribution":
+        return False, "趋势进入派发期，禁止交易"
 
-    if obv_ad_label == "强趋势回撤":
-        return True, "回撤建仓"
+    # ==================================================
+    # 3️⃣ 明确派发（最高优先级）
+    # ==================================================
+    if obv_ad_label == "派发阶段":
+        return False, "资金明确派发，禁止交易"
 
-    if obv_ad_label == "趋势中资金分歧":
-        return True, "小仓试探"
+    # ==================================================
+    # 4️⃣ 高风险量价结构（强烈压制）
+    # ==================================================
+    if obv_ad_label in {"高位放量分歧", "控盘减弱预警"}:
+        if trend_stage == "late":
+            return False, "高位资金博弈，避免参与"
+        return False, "资金结构恶化，仅观察"
 
+    # ==================================================
+    # 5️⃣ 生命周期分阶段处理
+    # ==================================================
+
+    # ---------- late：只允许最强信号 ----------
+    if trend_stage == "late":
+        if obv_ad_label == "强趋势回撤":
+            return True, "高位回撤，轻仓参与"
+        return False, "高位阶段，风险偏大"
+
+    # ---------- mid：主升浪 ----------
+    if trend_stage == "mid":
+        if obv_ad_label in {
+            "明确吸筹",
+            "极度缩量(隐蔽吸筹)",
+            "强趋势回撤",
+        }:
+            return True, "主升浪建仓/加仓"
+
+        if obv_ad_label in {
+            "趋势中资金分歧",
+            "底部试探",
+        }:
+            return True, "主升浪小仓试探"
+
+        return False, "量价支持不足"
+
+    # ---------- early：趋势初期 ----------
+    if trend_stage == "early":
+        if obv_ad_label in {
+            "明确吸筹",
+            "极度缩量(隐蔽吸筹)",
+            "底部试探",
+            "强趋势回撤",
+        }:
+            return True, "趋势初期建仓"
+
+        if obv_ad_label == "趋势中资金分歧":
+            return True, "早期分歧，小仓"
+
+        return False, "早期信号不足"
+
+    # ==================================================
+    # 6️⃣ unknown 生命周期（极度保守）
+    # ==================================================
+    if trend_stage == "unknown":
+        if (
+            trend_strength == "strong_uptrend"
+            and obv_ad_label in {
+                "明确吸筹",
+                "极度缩量(隐蔽吸筹)",
+            }
+        ):
+            return True, "阶段不明，小仓试探"
+
+        return False, "阶段不明，仅观察"
+
+    # ==================================================
+    # 7️⃣ 兜底
+    # ==================================================
     return False, "仅跟踪"
 
 
@@ -2944,6 +3034,7 @@ def apply_entry_stop_target_vix(
 
     return df
 
+
 # TrendStage 四分类（硬规则）
 # early          → 趋势刚启动
 # mid            → 主升浪可交易段
@@ -3225,6 +3316,12 @@ def main():
         axis=1
     )
 
+    # 计算趋势生命周期阶段
+    final_with_sim["trend_stage"] = final_with_sim.apply(
+        lambda row: classify_trend_stage(row),
+        axis=1
+    )
+
     # print("\n================ trend_strength 唯一取值全集 ================")
     # print(
     #     final_with_sim["trend_strength"]
@@ -3240,13 +3337,15 @@ def main():
     # =========================
     # V3：应用量价交易 Gate
     # =========================
-    gate_result = final_with_sim.apply(
-        lambda row: obv_ad_trade_gate(row['obv_ad_interpretation'], row.get('trend_strength')),
-        axis=1
+    final_with_sim[["allow_trade", "trade_state"]] = final_with_sim.apply(
+        lambda row: obv_ad_trade_gate(
+            row["obv_ad_interpretation"],
+            row["trend_strength"],
+            row["trend_stage"],
+        ),
+        axis=1,
+        result_type="expand"
     )
-    # print(f"\n🛡️  量价交易 Gate 结果统计: {gate_result}")
-    final_with_sim['allow_trade'] = gate_result.apply(lambda x: x[0])
-    final_with_sim['trade_state'] = gate_result.apply(lambda x: x[1])
 
     # 在允许交易的基础上，应用期权风险保险丝
     final_with_sim["allow_trade"] = (
@@ -3262,12 +3361,6 @@ def main():
     # 把期权情绪状态映射为中文
     final_with_sim["option_state_cn"] = final_with_sim["option_state"].map(
         OPTION_STATE_CN_MAP
-    )
-
-    # 计算趋势生命周期阶段
-    final_with_sim["trend_stage"] = final_with_sim.apply(
-        lambda row: classify_trend_stage(row),
-        axis=1
     )
 
     # =========================
