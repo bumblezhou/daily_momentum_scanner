@@ -1,3 +1,4 @@
+import random
 import requests
 import pandas as pd
 import duckdb
@@ -33,6 +34,7 @@ QUEUE_MAX_SIZE = 5000
 # ===============================================
 
 price_queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
+fundamental_queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 STOP_SIGNAL = object()
 
 
@@ -330,7 +332,6 @@ def mark_yf_unavailable(symbols):
             "UPDATE stock_ticker SET yf_price_available = FALSE WHERE symbol = ?", 
             [(s,) for s in symbols]
         )
-        con.execute("COMMIT") 
         print(f"🛠️ 数据库已更新：已永久屏蔽这 {len(symbols)} 只股票。")
     except Exception as e:
         print(f"❌ 数据库写入失败: {e}")
@@ -355,7 +356,7 @@ def yahoo_to_finnhub(symbol: str) -> str:
     return symbol.replace("-", ".")
 
 
-def duckdb_consumer():
+def price_consumer():
     con = duckdb.connect(DUCKDB_PATH)
     buffer = []
     SQL_INSERT = """
@@ -412,7 +413,7 @@ def update_recent_prices(watchlist: list = []):
     # 🔥 核心改变：记录哪些真正写进了数据库
     actual_success_yahoo_tickers = set()
 
-    consumer_thread = threading.Thread(target=duckdb_consumer, daemon=True)
+    consumer_thread = threading.Thread(target=price_consumer, daemon=True)
     consumer_thread.start()
 
     for i in range(0, len(yahoo_tickers), YF_BATCH_SIZE):
@@ -1410,6 +1411,167 @@ def extract_uoa_structured_from_yf(t: yf.Ticker) -> dict:
         return empty_uoa
 
 
+# 读取单个股票的基本面数据
+def load_fundamentals_by_yf(symbol):
+    """
+    从 yfinance 加载单个股票的基本面数据
+    """
+    fundamentals_info = {}
+    try:
+        t = yf.Ticker(finnhub_to_yahoo(symbol))
+        info = t.info
+
+        # 提取期权情绪数据
+        option_sentiment = extract_option_sentiment_from_yf(t)
+
+        # === 期权 UOA（结构化） ===
+        uoa_struct = extract_uoa_structured_from_yf(t)
+
+        opt_uoa_score = uoa_struct["opt_uoa_score"]
+        opt_uoa_call_bias = uoa_struct["opt_uoa_call_bias"]
+        opt_uoa_avg_dte = uoa_struct["opt_uoa_avg_dte"]
+        opt_uoa_type = uoa_struct["opt_uoa_type"]
+
+        # --- 金律字段提取 ---
+        market_cap = info.get('marketCap', 0) or 0
+
+        # 标准行业分类参考：
+        # "Technology"
+        # "Healthcare"
+        # "Financial Services"
+        # "Energy"
+        # "Basic Materials"
+        # "Industrials"
+        # "Consumer Cyclical"
+        # "Consumer Defensive"
+        # "Communication Services"
+        # "Utilities"
+        # "Real Estate"
+        sector = info.get("sector")
+        industry = info.get("industry")
+        
+        # 提取 CAN SLIM 指标
+        quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
+        annual_eps_growth = info.get("earningsGrowth")  # A (年度)
+        rev_growth = info.get("revenueGrowth")  # 辅助
+        roe = info.get("returnOnEquity")
+        shares_outstanding = info.get("sharesOutstanding")  # S
+        inst_own = info.get("heldPercentInstitutions")  # I
+        fcf = info.get("freeCashflow")
+        ocf = info.get("operatingCashflow")
+        # 计算前瞻每股收益增长率
+        # forward_eps_growth = (info.get('forwardEps', 0) / info.get('trailingEps', 1) - 1) if info.get('trailingEps') else None
+        current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+        target_mean_price = info.get('targetMeanPrice')
+        # 计算自由现金流质量
+        fcf_quality = (fcf / ocf) if (fcf and ocf and ocf > 0) else None
+
+        # 计算 CAN SLIM 分数 (简化：每个组件达标加1分)
+        score = 0
+        if quarterly_eps_growth and quarterly_eps_growth > 0.25: score += 1  # C >25%
+        if annual_eps_growth and annual_eps_growth > 0.25: score += 1  # A >25%
+        if rev_growth and rev_growth > 0.15: score += 1  # 营收辅助
+        if shares_outstanding and shares_outstanding < 100000000: score += 1  # S: 低股本 <1亿股 (可调)
+        if inst_own and inst_own > 0.5: score += 1  # I: 机构 >50%
+        # if forward_eps_growth > 0.20: score += 1  # L: 前瞻 EPS 增长 >20%
+        if current_price and target_mean_price and current_price > 0:
+            implied_growth = (target_mean_price / current_price) - 1
+            if implied_growth > 0.20:  # 分析师预期上涨 >20%
+                score += 1
+        if fcf_quality is not None and fcf_quality > 0.8: score += 1  # 高质量现金转化
+
+        fundamentals_info["symbol"] = symbol
+        fundamentals_info["sector"] = sector
+        fundamentals_info["industry"] = industry
+        fundamentals_info["quarterly_eps_growth"] = quarterly_eps_growth
+        fundamentals_info["annual_eps_growth"] = annual_eps_growth
+        fundamentals_info["rev_growth"] = rev_growth
+        fundamentals_info["roe"] = roe
+        fundamentals_info["shares_outstanding"] = shares_outstanding
+        fundamentals_info["inst_own"] = inst_own
+        fundamentals_info["fcf_quality"] = fcf_quality
+        fundamentals_info["score"] = score
+        fundamentals_info["market_cap"] = market_cap
+        fundamentals_info["opt_pc_ratio"] = option_sentiment.get("opt_pc_ratio")
+        fundamentals_info["opt_avg_iv"] = option_sentiment.get("opt_avg_iv")
+        fundamentals_info["opt_uoa_detected"] = option_sentiment.get("opt_uoa_detected")
+        fundamentals_info["opt_uoa_score"] = opt_uoa_score
+        fundamentals_info["opt_uoa_call_bias"] = opt_uoa_call_bias
+        fundamentals_info["opt_uoa_avg_dte"] = opt_uoa_avg_dte
+        fundamentals_info["opt_uoa_type"] = opt_uoa_type
+    except Exception as e:
+        # 捕获可能的限流异常
+        if "429" in str(e):
+            print(f"检测到限流 (429)，尝试大幅度延迟...")
+            time.sleep(random.uniform(3, 8)) 
+        raise e
+
+    return fundamentals_info
+
+
+def fundamental_consumer():
+    con = duckdb.connect(DUCKDB_PATH)
+    fundamental_buffer = []
+    
+    SQL_INSERT_FUNDAMENTAL = """
+        INSERT OR REPLACE INTO stock_fundamentals 
+        VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    sector_buffer = []
+    SQL_INSERT_SECTOR = """
+        UPDATE stock_ticker
+        SET sector = ?, industry = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE symbol = ?
+    """
+    while True:
+        info = fundamental_queue.get()
+
+        if info is STOP_SIGNAL:
+            break
+
+        # 逐行获取fundamental数据
+        fundamental_buffer.append((info.get("symbol"), 
+            info.get("quarterly_eps_growth"), 
+            info.get("annual_eps_growth"), 
+            info.get("rev_growth"), 
+            info.get("roe"), 
+            info.get("shares_outstanding"), 
+            info.get("inst_own"), 
+            info.get("fcf_quality"), 
+            info.get("score"), 
+            info.get("market_cap"), 
+            0, 
+            info.get("opt_pc_ratio"), 
+            info.get("opt_avg_iv"), 
+            info.get("opt_uoa_detected"),
+            info.get("opt_uoa_score"),
+            info.get("opt_uoa_call_bias"),
+            info.get("opt_uoa_avg_dte"),
+            info.get("opt_uoa_type")))
+        # 逐行获取sector数据
+        sector_buffer.append((info.get("sector"), info.get("industry"), info.get("symbol")))
+
+        # 批量fundamental插入
+        if len(fundamental_buffer) >= INSERT_BATCH_SIZE:
+            con.executemany(SQL_INSERT_FUNDAMENTAL, fundamental_buffer)
+            fundamental_buffer.clear()
+        # 批量sector更新
+        if len(sector_buffer) >= INSERT_BATCH_SIZE:
+            con.executemany(SQL_INSERT_SECTOR, sector_buffer)
+            sector_buffer.clear()
+    
+        print(f"              🛠️ 已处理基本面数据: {info.get('symbol')}")
+
+    # 插入剩余数据
+    if fundamental_buffer:
+        con.executemany(SQL_INSERT_FUNDAMENTAL, fundamental_buffer)
+    # 更新剩余sector数据
+    if sector_buffer:
+        con.executemany(SQL_INSERT_SECTOR, sector_buffer)
+
+    con.close()
+
+
 # 编写“增量更新”脚本（扩展为 CAN SLIM）
 def update_fundamentals(con, ticker_list, force_update=False):
     """
@@ -1434,112 +1596,26 @@ def update_fundamentals(con, ticker_list, force_update=False):
         print("✅ 所有基本面数据均在有效期内，无需更新。")
         return
 
-    update_count = 1
+    consumer_thread = threading.Thread(target=fundamental_consumer, daemon=True)
+    consumer_thread.start()
+
     print(f"🚀 开始更新 {len(need_update)} 只股票的基本面...")
-    for symbol in need_update:
+    update_count = 1
+    for ticker in need_update:
         try:
-            if update_count % YF_BATCH_SIZE == 0:
-                print(f"  [{update_count}/{len(need_update)}] 更新 {symbol} ... ")
-            t = yf.Ticker(finnhub_to_yahoo(symbol))
-            info = t.info
-
-            # 提取期权情绪数据
-            option_sentiment = extract_option_sentiment_from_yf(t)
-
-            # === 期权 UOA（结构化） ===
-            uoa_struct = extract_uoa_structured_from_yf(t)
-
-            opt_uoa_score = uoa_struct["opt_uoa_score"]
-            opt_uoa_call_bias = uoa_struct["opt_uoa_call_bias"]
-            opt_uoa_avg_dte = uoa_struct["opt_uoa_avg_dte"]
-            opt_uoa_type = uoa_struct["opt_uoa_type"]
-
-            # --- 金律字段提取 ---
-            market_cap = info.get('marketCap', 0) or 0
-
-            # 更新 sector 和 industry
-            sector = info.get("sector")
-            industry = info.get("industry")
-            con.execute("""
-                UPDATE stock_ticker
-                SET sector = ?, industry = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE symbol = ?
-            """, (sector, industry, symbol))
-
-            # 标准行业分类参考：
-            # "Technology"
-            # "Healthcare"
-            # "Financial Services"
-            # "Energy"
-            # "Basic Materials"
-            # "Industrials"
-            # "Consumer Cyclical"
-            # "Consumer Defensive"
-            # "Communication Services"
-            # "Utilities"
-            # "Real Estate"
-            
-            # 提取 CAN SLIM 指标
-            quarterly_eps_growth = info.get("earningsQuarterlyGrowth")  # C
-            annual_eps_growth = info.get("earningsGrowth")  # A (年度)
-            rev_growth = info.get("revenueGrowth")  # 辅助
-            roe = info.get("returnOnEquity")
-            shares_outstanding = info.get("sharesOutstanding")  # S
-            inst_own = info.get("heldPercentInstitutions")  # I
-            fcf = info.get("freeCashflow")
-            ocf = info.get("operatingCashflow")
-            # 计算前瞻每股收益增长率
-            # forward_eps_growth = (info.get('forwardEps', 0) / info.get('trailingEps', 1) - 1) if info.get('trailingEps') else None
-            current_price = info.get('currentPrice') or info.get('regularMarketPrice')
-            target_mean_price = info.get('targetMeanPrice')
-            # 计算自由现金流质量
-            fcf_quality = (fcf / ocf) if (fcf and ocf and ocf > 0) else None
-
-            # 计算 CAN SLIM 分数 (简化：每个组件达标加1分)
-            score = 0
-            if quarterly_eps_growth and quarterly_eps_growth > 0.25: score += 1  # C >25%
-            if annual_eps_growth and annual_eps_growth > 0.25: score += 1  # A >25%
-            if rev_growth and rev_growth > 0.15: score += 1  # 营收辅助
-            if shares_outstanding and shares_outstanding < 100000000: score += 1  # S: 低股本 <1亿股 (可调)
-            if inst_own and inst_own > 0.5: score += 1  # I: 机构 >50%
-            # if forward_eps_growth > 0.20: score += 1  # L: 前瞻 EPS 增长 >20%
-            if current_price and target_mean_price and current_price > 0:
-                implied_growth = (target_mean_price / current_price) - 1
-                if implied_growth > 0.20:  # 分析师预期上涨 >20%
-                    score += 1
-            if fcf_quality is not None and fcf_quality > 0.8: score += 1  # 高质量现金转化
-            # N/L/M 在技术筛选中处理
-
-            # 使用 UPSERT 逻辑
-            con.execute("""
-                INSERT OR REPLACE INTO stock_fundamentals 
-                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, 
-                  quarterly_eps_growth, 
-                  annual_eps_growth, 
-                  rev_growth, 
-                  roe, 
-                  shares_outstanding, 
-                  inst_own, 
-                  fcf_quality, 
-                  score, 
-                  market_cap, 
-                  0, 
-                  option_sentiment.get("opt_pc_ratio"), 
-                  option_sentiment.get("opt_avg_iv"), 
-                  option_sentiment.get("opt_uoa_detected"),
-                  opt_uoa_score,
-                  opt_uoa_call_bias,
-                  opt_uoa_avg_dte,
-                  opt_uoa_type)
-            )
+            fundamentals_info = load_fundamentals_by_yf(ticker)
+            fundamental_queue.put(fundamentals_info)
+            print(f"  [{update_count}/{len(need_update)}] 已下载基本面数据: {ticker}")
             update_count += 1
-
         except Exception as e:
-            print(f"  [ERR] {symbol} 更新失败: {e}")
-            continue
+            print(f"Error updating {ticker}: {e}")
+    
+    fundamental_queue.put(STOP_SIGNAL)
+    consumer_thread.join()
+    print(f"✅ 基本面数据更新完成，共更新 {update_count} 只股票。")
 
 
+# 获取数据库中最新的交易日期
 def get_latest_date_in_db():
     con = duckdb.connect(DUCKDB_PATH)
     latest_date_in_db = con.execute("SELECT MAX(trade_date) FROM stock_price").fetchone()[0]
@@ -3295,7 +3371,7 @@ def fetch_current_vix():
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "ORLA", "RVLV", "WS"]
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "ORLA", "RVLV", "WS", "CDE"]
 # ===============================================
 
 # ===================== 主流程 =====================
