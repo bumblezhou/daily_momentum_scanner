@@ -2794,17 +2794,14 @@ def diagnose_stage2_filters(con, target_date):
     print("="*80 + "\n")
 
 
-def reset_yf_availability(con):
+def reset_yf_availability():
     """
     重置所有股票的yf_price_available标记
     用于修复被错误标记的股票
     """
     print("\n🔄 重置yf_price_available标记...")
     
-    # 先备份当前标记
-    before = con.execute("""
-        SELECT COUNT(*) FROM stock_ticker WHERE yf_price_available = FALSE
-    """).fetchone()[0]
+    con = duckdb.connect(DUCKDB_PATH)
     
     # 重置所有标记
     con.execute("""
@@ -2813,8 +2810,8 @@ def reset_yf_availability(con):
         WHERE type = 'Common Stock'
         AND mic IN ('XNYS','XNGS','XNAS','XASE','ARCX','BATS','IEXG')
     """)
-    
-    print(f"✅ 已重置 {before} 个标记")
+
+    con.close()
     print("   现在可以重新运行 fetch_all_prices() 或 update_recent_prices()")
 
 
@@ -2892,12 +2889,10 @@ def build_price_history_map(
     return price_history_map
 
 
+# =========================
+# V3 新增：VWAP 和盘前高点获取
+# =========================
 def get_vwap_and_premarket_high(ticker, target_date):
-    import yfinance as yf
-    import pandas as pd
-    import pytz
-    from datetime import datetime, timedelta, date
-
     try:
         # ---- normalize date ----
         if isinstance(target_date, str):
@@ -2921,13 +2916,15 @@ def get_vwap_and_premarket_high(ticker, target_date):
         if df.empty:
             return None, None
 
-        # ---- FIX: correct MultiIndex flatten ----
+        # ---- correct MultiIndex flatten ----
         if isinstance(df.columns, pd.MultiIndex):
-            # level 0 = OHLCV, level 1 = ticker
             df.columns = df.columns.get_level_values(0)
 
         # ---- normalize columns ----
         df.columns = [c.lower() for c in df.columns]
+
+        # ---- CRITICAL FIX: drop duplicated columns ----
+        df = df.loc[:, ~df.columns.duplicated()]
 
         # ---- timezone ----
         et = pytz.timezone("America/New_York")
@@ -2947,18 +2944,34 @@ def get_vwap_and_premarket_high(ticker, target_date):
 
         # ---- VWAP ----
         vwap = None
-        if not regular.empty and regular["volume"].sum() > 0:
-            typical_price = (
-                regular["high"] + regular["low"] + regular["close"]
-            ) / 3
-            vwap = (typical_price * regular["volume"]).sum() / regular["volume"].sum()
+        if not regular.empty and "volume" in regular.columns:
+
+            vol = regular["volume"]
+            if isinstance(vol, pd.DataFrame):
+                vol = vol.iloc[:, 0]
+
+            if vol.sum() > 0:
+                high = regular["high"]
+                low = regular["low"]
+                close = regular["close"]
+
+                if isinstance(high, pd.DataFrame):
+                    high = high.iloc[:, 0]
+                    low = low.iloc[:, 0]
+                    close = close.iloc[:, 0]
+
+                typical_price = (high + low + close) / 3
+                vwap = (typical_price * vol).sum() / vol.sum()
 
         # ---- Premarket High ----
-        premarket_high = (
-            premarket["high"].max()
-            if not premarket.empty
-            else None
-        )
+        premarket_high = None
+        if not premarket.empty and "high" in premarket.columns:
+            high_pm = premarket["high"]
+            if isinstance(high_pm, pd.DataFrame):
+                high_pm = high_pm.iloc[:, 0]
+            premarket_high = high_pm.max()
+        
+        print(f"[获取VWAP数据成功] {ticker}: VWAP={vwap}, Premarket High={premarket_high}")
 
         return (
             float(vwap) if vwap is not None else None,
@@ -3111,19 +3124,19 @@ def calculate_target_price_vix(
 
     # 针对 RS_Rank > 90 的领头羊，使用更激进的获利预期
     if trend_strength == "strong_uptrend":
-        # 领头羊（RS>90）给 3.5 倍 ATR 空间，普通强趋势给 2.8 倍
-        atr_mult = 3.5 if rs_rank > 90 else 2.8
+        # 领头羊（RS>90）给 3.5 倍 ATR 空间，普通强趋势给 2.8 倍 (不能太高，防止目标价过高，2.0 为宜)
+        atr_mult = 3.5 if rs_rank > 90 else 2.0
     elif trend_strength == "uptrend":
-        atr_mult = 2.2
-    elif trend_strength == "trend_pullback":
         atr_mult = 1.8
+    elif trend_strength == "trend_pullback":
+        atr_mult = 1.5
     else:
-        atr_mult = 1.2
+        atr_mult = 1.1
 
     target = entry_price + (adj_atr * atr_mult)
     
     # 实战建议：对于波段交易，25% - 35% 是一个典型的机构减仓位
-    return round(min(target, entry_price * 1.35), 2)
+    return round(min(target, entry_price * 1.15), 2) # 上限15%，避免偏高
 
 # =========================
 # V3 新增：VIX 波动率调节因子
@@ -3385,6 +3398,8 @@ def main():
     # 首次执行时解开注释执行，以后每天轮动不用再执行
     # fetch_all_prices()
 
+    # reset_yf_availability()
+
     # 3️⃣ State 1: C, 每天只需更新最新的股票价格数据即可
     print(f"🚀 Stage 1: 更新最新的股票价格数据")
     # 新增：确保SPY和QQQ数据更新，用于Market Regime Filter
@@ -3405,7 +3420,6 @@ def main():
 
     # 🔥 新增：先检查数据完整性
     check_data_integrity(con)
-
 
     # 🚀 修复点：自动获取库中最新的交易日期
     latest_date_in_db = get_latest_date_in_db()
@@ -3428,8 +3442,12 @@ def main():
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    # stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
-    stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    use_strict_rule = False
+    stage2 = pd.DataFrame()
+    if use_strict_rule:
+        stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+    else:
+        stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     print(f"Stage 2 股票数量: {len(stage2)}")
 
     # if stage2.empty:
@@ -3477,9 +3495,6 @@ def main():
     
     # 关闭连接
     con.close()
-
-    # 计算建议止盈位（以支撑位为基准的 3:1 盈亏比，或简单的 20% 目标）
-    final_with_sim['target_profit'] = (final_with_sim['close'] * 1.20).round(2)
 
     for col in ["obv_slope_20", "obv_slope_5", "ad_slope_20", "ad_slope_5", "vol_rs_vcp", "price_tightness"]:
         final_with_sim[col] = final_with_sim[col].fillna(0.0)
@@ -3603,7 +3618,11 @@ def main():
 
     # 保存结果
     if not final_with_sim.empty:
-        file_name_xlsx = f"swing_strategy_vix_sim_{datetime.now():%Y%m%d}.xlsx"
+        file_name_xlsx = ""
+        if use_strict_rule:
+            file_name_xlsx = f"swing_strategy_vix_sim_strict_{datetime.now():%Y%m%d}.xlsx"
+        else:
+            file_name_xlsx = f"swing_strategy_vix_sim_balanced_{datetime.now():%Y%m%d}.xlsx"
         try:
             final_with_sim[display_cols].to_excel(file_name_xlsx, index=False, engine='openpyxl')
             print(f"\n📊 详细策略报告已生成 Excel: {file_name_xlsx}")
