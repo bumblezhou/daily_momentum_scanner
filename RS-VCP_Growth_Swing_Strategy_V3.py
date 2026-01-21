@@ -3506,7 +3506,7 @@ def fetch_current_vix():
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "ORLA", "RVLV", "WS", "CDE", "BMY"]
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "CDE", "BMY", "ATMU"]
 # ===============================================
 
 # ===================== 主流程 =====================
