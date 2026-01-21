@@ -2889,6 +2889,43 @@ def build_price_history_map(
     return price_history_map
 
 
+def is_price_reasonable(high_series, last_close, max_ratio=1.5):
+    if last_close is None or last_close <= 0:
+        return True
+    return high_series.max() <= last_close * max_ratio
+
+
+def get_us_trading_date(latest_date_in_db):
+    """
+    根据美东时间 + 数据库最新交易日，判断当前应使用的美股交易日
+    """
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+
+    latest_date = (
+        latest_date_in_db
+        if isinstance(latest_date_in_db, date)
+        else datetime.strptime(latest_date_in_db, "%Y-%m-%d").date()
+    )
+
+    # 如果现在还是在 latest_date 的盘前（04:00–09:30 ET）
+    premarket_start = et.localize(
+        datetime.combine(latest_date, datetime.min.time()).replace(hour=4)
+    )
+    rth_start = et.localize(
+        datetime.combine(latest_date, datetime.min.time()).replace(hour=9, minute=30)
+    )
+
+    if premarket_start <= now_et < rth_start:
+        return latest_date
+
+    # 如果已经进入下一个交易日的盘前（例如周一凌晨）
+    if now_et.date() > latest_date:
+        return now_et.date()
+
+    return latest_date
+
+
 # =========================
 # V3 新增：VWAP 和盘前高点获取
 # =========================
@@ -2902,50 +2939,46 @@ def get_vwap_and_premarket_high(ticker, target_date):
         elif not isinstance(target_date, date):
             raise ValueError("Invalid target_date")
 
-        # ---- fetch data ----
-        df = yf.download(
+        et = pytz.timezone("America/New_York")
+
+        pm_date = get_us_trading_date(target_date)
+
+        # =========================
+        # 1️⃣ VWAP: 用 target_date
+        # =========================
+        df_vwap = yf.download(
             ticker,
             start=target_date,
             end=target_date + timedelta(days=1),
             interval="1m",
             prepost=True,
             progress=False,
-            threads=False
+            threads=False, 
+            auto_adjust=True
         )
 
-        if df.empty:
+        if df_vwap.empty:
             return None, None
 
-        # ---- correct MultiIndex flatten ----
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        if isinstance(df_vwap.columns, pd.MultiIndex):
+            df_vwap.columns = df_vwap.columns.get_level_values(0)
 
-        # ---- normalize columns ----
-        df.columns = [c.lower() for c in df.columns]
+        df_vwap.columns = [c.lower() for c in df_vwap.columns]
+        df_vwap = df_vwap.loc[:, ~df_vwap.columns.duplicated()]
 
-        # ---- CRITICAL FIX: drop duplicated columns ----
-        df = df.loc[:, ~df.columns.duplicated()]
-
-        # ---- timezone ----
-        et = pytz.timezone("America/New_York")
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC").tz_convert(et)
+        if df_vwap.index.tz is None:
+            df_vwap.index = df_vwap.index.tz_localize("UTC").tz_convert(et)
         else:
-            df.index = df.index.tz_convert(et)
+            df_vwap.index = df_vwap.index.tz_convert(et)
 
-        # ---- time windows ----
         base = datetime.combine(target_date, datetime.min.time())
         regular_start = et.localize(base.replace(hour=9, minute=30))
         regular_end   = et.localize(base.replace(hour=16, minute=0))
-        premarket_start = et.localize(base.replace(hour=4, minute=0))
 
-        regular = df[(df.index >= regular_start) & (df.index < regular_end)]
-        premarket = df[(df.index >= premarket_start) & (df.index < regular_start)]
+        regular = df_vwap[(df_vwap.index >= regular_start) & (df_vwap.index < regular_end)]
 
-        # ---- VWAP ----
         vwap = None
         if not regular.empty and "volume" in regular.columns:
-
             vol = regular["volume"]
             if isinstance(vol, pd.DataFrame):
                 vol = vol.iloc[:, 0]
@@ -2963,15 +2996,57 @@ def get_vwap_and_premarket_high(ticker, target_date):
                 typical_price = (high + low + close) / 3
                 vwap = (typical_price * vol).sum() / vol.sum()
 
-        # ---- Premarket High ----
+        # =========================
+        # 2️⃣ Premarket High: 用 pm_date
+        # =========================
+        df_pm = yf.download(
+            ticker,
+            start=pm_date,
+            end=pm_date + timedelta(days=1),
+            interval="1m",
+            prepost=True,
+            progress=False,
+            threads=False,
+            auto_adjust=True
+        )
+
+        if df_pm is None or len(df_pm) == 0:
+            return None, None
+
         premarket_high = None
-        if not premarket.empty and "high" in premarket.columns:
-            high_pm = premarket["high"]
-            if isinstance(high_pm, pd.DataFrame):
-                high_pm = high_pm.iloc[:, 0]
-            premarket_high = high_pm.max()
-        
-        print(f"[获取VWAP数据成功] {ticker}: VWAP={vwap}, Premarket High={premarket_high}")
+        if not df_pm.empty:
+            if isinstance(df_pm.columns, pd.MultiIndex):
+                df_pm.columns = df_pm.columns.get_level_values(0)
+
+            df_pm.columns = [c.lower() for c in df_pm.columns]
+            df_pm = df_pm.loc[:, ~df_pm.columns.duplicated()]
+
+            if df_pm.index.tz is None:
+                df_pm.index = df_pm.index.tz_localize("UTC").tz_convert(et)
+            else:
+                df_pm.index = df_pm.index.tz_convert(et)
+
+            pm_base = datetime.combine(pm_date, datetime.min.time())
+            pm_start = et.localize(pm_base.replace(hour=4))
+            rth_start = et.localize(pm_base.replace(hour=9, minute=30))
+
+            pm = df_pm[(df_pm.index >= pm_start) & (df_pm.index < rth_start)]
+
+            if not pm.empty and "high" in pm.columns:
+                high_pm = pm["high"]
+                if isinstance(high_pm, pd.DataFrame):
+                    high_pm = high_pm.iloc[:, 0]
+                premarket_high = high_pm.max()
+            
+            last_close = regular["close"].iloc[-1] if not regular.empty else None
+            if not is_price_reasonable(high_pm, last_close):
+                premarket_high = None
+
+        print(
+            f"[获取VWAP数据成功] {ticker}: "
+            f"VWAP({target_date})={vwap}, "
+            f"Premarket High({pm_date})={premarket_high}"
+        )
 
         return (
             float(vwap) if vwap is not None else None,
@@ -3124,19 +3199,65 @@ def calculate_target_price_vix(
 
     # 针对 RS_Rank > 90 的领头羊，使用更激进的获利预期
     if trend_strength == "strong_uptrend":
-        # 领头羊（RS>90）给 3.5 倍 ATR 空间，普通强趋势给 2.8 倍 (不能太高，防止目标价过高，2.0 为宜)
-        atr_mult = 3.5 if rs_rank > 90 else 2.0
+        # 领头羊（RS>90）给 3.0 倍 ATR 空间，普通强趋势给 2.0 倍 (不能太高，防止目标价过高，2.0 为宜)
+        atr_mult = 3.0 if rs_rank > 90 else 2.0
     elif trend_strength == "uptrend":
-        atr_mult = 1.8
+        atr_mult = 1.7
     elif trend_strength == "trend_pullback":
-        atr_mult = 1.5
+        atr_mult = 1.4
     else:
         atr_mult = 1.1
 
     target = entry_price + (adj_atr * atr_mult)
-    
-    # 实战建议：对于波段交易，25% - 35% 是一个典型的机构减仓位
-    return round(min(target, entry_price * 1.15), 2) # 上限15%，避免偏高
+
+    # === 动态上限：不超过 2.8 ATR 或 12%（取小）===
+    atr_cap = entry_price + adj_atr * 2.8
+    pct_cap = entry_price * 1.12
+
+    return round(min(target, atr_cap, pct_cap), 2)
+
+
+def calculate_target_price_vix_pm(
+    entry_price: float,
+    atr: float | None,
+    trend_strength: str,
+    rs_rank: float,
+    current_vix: float,
+    premarket_high: float | None = None
+) -> float:
+    """
+    基于现有 calculate_target_price_vix，
+    结合盘前高点动态修正 target_price
+    """
+
+    # === 1. 原始 target（基于 entry_price） ===
+    base_target = calculate_target_price_vix(
+        entry_price=entry_price,
+        atr=atr,
+        trend_strength=trend_strength,
+        rs_rank=rs_rank,
+        current_vix=current_vix
+    )
+
+    # === 2. 没有盘前数据，直接返回 ===
+    if premarket_high is None:
+        return base_target
+
+    # === 3. 盘前已经突破 entry_price（Gap / 强势）===
+    if premarket_high > entry_price * 1.01:
+        # 抬高锚点，用盘前高点重新计算
+        adjusted_target = calculate_target_price_vix(
+            entry_price=premarket_high,
+            atr=atr,
+            trend_strength=trend_strength,
+            rs_rank=rs_rank,
+            current_vix=current_vix
+        )
+        return round(max(adjusted_target, premarket_high * 1.03), 2)
+
+    # === 4. 盘前未突破，仅作为保护下限 ===
+    return round(max(base_target, premarket_high), 2)
+
 
 # =========================
 # V3 新增：VIX 波动率调节因子
@@ -3208,12 +3329,13 @@ def apply_entry_stop_target_vix(
         )
 
         # === Target ===
-        target_profit = calculate_target_price_vix(
+        target_profit = calculate_target_price_vix_pm(
             entry_price=entry_price,
             atr=atr,
             trend_strength=trend_strength,
             rs_rank=rs_rank,
-            current_vix=current_vix
+            current_vix=current_vix,
+            premarket_high=premarket_high
         )
 
         ideal_entry_list.append(ideal_entry)
@@ -3371,7 +3493,7 @@ def fetch_current_vix():
     """
     获取当前 VIX 指数值"""
     try:
-        vix_df = yf.download("^VIX", period="1d", progress=False, proxy=PROXIES["http"])
+        vix_df = yf.download("^VIX", period="1d", progress=False, auto_adjust=True, proxy=PROXIES["http"])
         # 获取最新 VIX 收盘价，若失败则取默认值 18.0
         current_vix = vix_df['Close'].iloc[-1] if not vix_df.empty else 18.0
         if isinstance(current_vix, pd.Series): current_vix = current_vix.iloc[0]
@@ -3384,7 +3506,7 @@ def fetch_current_vix():
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "ORLA", "RVLV", "WS", "CDE"]
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "ORLA", "RVLV", "WS", "CDE", "BMY"]
 # ===============================================
 
 # ===================== 主流程 =====================
