@@ -1865,6 +1865,7 @@ def update_volume_trend_features(con, latest_trading_day: str):
 # | ------------        | -------------      | -------- |
 # | 极度缩量(隐蔽吸筹)    | 隐蔽建仓（VCP/WWD） | 🟢 低   |
 # | 明确吸筹             | 主动进攻            | 🟢 低   |
+# | 趋势加速放量         | 趋势加速            | 🟢 低   |
 # | 强趋势回撤           | 洗盘 / 换手         | 🟢 低~中 |
 # | 底部试探             | 早期试水            | 🟡 中   |
 # | 趋势中资金分歧        | 多空未统一          | 🟡 中   |
@@ -1885,6 +1886,17 @@ def classify_obv_ad_enhanced(
     # 阈值定义
     STRONG = 0.1 # 只要平均每日净流入达到日均成交量的 10% 就算强
     WEAK = 0.02
+
+    # === 新增：短期资金是否加速 ===
+    obv_accel = obv_s5 - obv_s20
+    ad_accel = ad_s5 - ad_s20
+
+    is_fund_accelerating = (
+        obv_s20 > STRONG and
+        ad_s20 > STRONG and
+        obv_accel > WEAK and
+        ad_accel > WEAK
+    )
     
     price_tightness = 1.0 # 默认不紧致
     try:
@@ -1907,6 +1919,10 @@ def classify_obv_ad_enhanced(
     # --- 3️⃣ 高位放量震荡 (WS预警型) ---
     # 逻辑：如果成交量很大(vol_rs_vcp > 1.2)，但价格波幅很大(>8%)，说明分歧严重
     if vol_rs_vcp > 1.2 and price_tightness > 0.08:
+        # ✅ 新增：如果资金在“加速流入”，判为趋势加速，而不是分歧
+        if is_fund_accelerating:
+            return "趋势加速放量"
+        # ❌ 否则，才是真正的高位分歧
         return "高位放量分歧"
 
     # --- 4️⃣ 其他原逻辑 ---
@@ -2020,6 +2036,7 @@ def obv_ad_trade_gate(
             "明确吸筹",
             "极度缩量(隐蔽吸筹)",
             "强趋势回撤",
+            "趋势加速放量",   # ✅ 新增
         }:
             return True, "主升浪建仓/加仓"
 
@@ -2198,8 +2215,9 @@ def compute_trend_strength_from_row(
 # '明确吸筹', '强趋势回撤', '趋势中资金分歧', '控盘减弱预警', '底部试探', '派发阶段', '量价中性'
 OBV_SCORE_MAP = {
     # === 主动进攻型 ===
-    "明确吸筹": 1.00,          # 最理想：趋势 + 资金 + 共振
-    "极度缩量(隐蔽吸筹)": 0.98,   # 这种形态通常是爆发前夜，极具价值
+    "明确吸筹": 1.00,           # 最理想：趋势 + 资金 + 共振
+    "极度缩量(隐蔽吸筹)": 0.98,  # 这种形态通常是爆发前夜，极具价值
+    "趋势加速放量": 0.90,       # 强势趋势中的加速，极高价值
     # === 趋势中健康结构 ===
     "强趋势回撤": 0.85,        # 上升趋势中的洗盘，极高价值
     "底部试探": 0.75,          # 早期资金介入，允许小仓位
@@ -2211,16 +2229,6 @@ OBV_SCORE_MAP = {
     "控盘减弱预警": 0.30,      # 不宜新开仓，防止诱多
     # === 明确回避 ===
     "派发阶段": 0.00           # 资金持续流出
-}
-
-# 趋势强度调制因子
-TREND_STRENGTH_MULTIPLIER = {
-    "strong_uptrend": 1.15,
-    "uptrend": 1.05,
-    "trend_pullback": 1.10,
-    "range": 0.85,
-    "downtrend": 0.70,
-    "unknown": 0.80,
 }
 
 
