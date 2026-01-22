@@ -1942,37 +1942,6 @@ def classify_obv_ad_enhanced(
     return "量价中性"
 
 
-def classify_price_trend(
-    ema20,
-    ema50,
-    adx,
-    adx_strong=25,
-    adx_weak=15
-):
-    """
-    价格趋势强度分类
-    只看价格，不看资金
-    """
-
-    if pd.isna(ema20) or pd.isna(ema50) or pd.isna(adx):
-        return "unknown"
-
-    # === 强趋势 ===
-    if ema20 > ema50 and adx >= adx_strong:
-        return "strong_uptrend"
-
-    # === 温和上升趋势 ===
-    if ema20 > ema50 and adx >= adx_weak:
-        return "uptrend"
-
-    # === 趋势走弱 ===
-    if ema20 < ema50 and adx >= adx_weak:
-        return "downtrend"
-
-    # === 无趋势 / 震荡 ===
-    return "sideways"
-
-
 # =========================
 # V3 修正版：量价交易资格判定（返回二元组）
 # =========================
@@ -2121,6 +2090,20 @@ def compute_adx(df, period=14):
     return adx
 
 
+# =========================
+# 方向是否明确？
+# EMA20 > EMA50 → 上行结构
+# EMA20 < EMA50 → 下行结构
+# 结构是否稳定?
+# ADX 高 → 价格在“走趋势”
+# ADX 低 → 价格在“来回震荡”
+# 当前处在什么地形？
+# trend_strength	地形隐喻	含义
+# strong_uptrend	高速公路	可以执行几乎所有多头资金信号
+# uptrend	        普通公路	可执行高质量资金信号
+# sideways	        平地/沙地	只观察，不冲锋
+# downtrend	        下坡路	    禁止做多
+# =========================
 def compute_trend_strength_from_row(
     row,
     price_history_map: dict,
@@ -2308,6 +2291,7 @@ def compute_trade_score(row, sector_avg_rs: dict) -> float:
 
     final_score = max(0.0, min(base_score * 100, 100.0))
     return round(final_score, 2)
+
 
 # =========================
 # V3.1 修改：期权风险保险丝（结构化 UOA）
@@ -3628,6 +3612,7 @@ def main():
 
     for col in ["obv_slope_20", "obv_slope_5", "ad_slope_20", "ad_slope_5", "vol_rs_vcp", "price_tightness"]:
         final_with_sim[col] = final_with_sim[col].fillna(0.0)
+
     # 量价趋势特征解读
     final_with_sim['obv_ad_interpretation'] = final_with_sim.apply(
         lambda row: classify_obv_ad_enhanced(
@@ -3642,20 +3627,7 @@ def main():
         axis=1
     )
 
-    # =========================
-    # 方向是否明确？
-    # EMA20 > EMA50 → 上行结构
-    # EMA20 < EMA50 → 下行结构
-    # 结构是否稳定?
-    # ADX 高 → 价格在“走趋势”
-    # ADX 低 → 价格在“来回震荡”
-    # 当前处在什么地形？
-    # trend_strength	地形隐喻	含义
-    # strong_uptrend	高速公路	可以执行几乎所有多头资金信号
-    # uptrend	        普通公路	可执行高质量资金信号
-    # sideways	        平地/沙地	只观察，不冲锋
-    # downtrend	        下坡路	    禁止做多
-    # =========================
+    # 计算趋势强度
     final_with_sim["trend_strength"] = final_with_sim.apply(
         lambda row: compute_trend_strength_from_row(row, price_history_map),
         axis=1
