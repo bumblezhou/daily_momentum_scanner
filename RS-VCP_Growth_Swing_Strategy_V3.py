@@ -1948,10 +1948,11 @@ def classify_obv_ad_enhanced(
 def obv_ad_trade_gate(
     obv_ad_label: str,
     trend_strength: str,
-    trend_stage: str
+    trend_stage: str,
+    trend_activity: str
 ):
     """
-    基于 trend_strength + trend_stage + OBV/AD 的风险导向交易闸门
+    基于 trend_strength + trend_stage + trend_activity + OBV/AD 的风险导向交易闸门
 
     返回：
         (allow_trade: bool, action_hint: str)
@@ -1970,6 +1971,13 @@ def obv_ad_trade_gate(
         return False, "非趋势结构，仅观察"
 
     # ==================================================
+    # 🔧 NEW：趋势是否真实在“走”
+    # ==================================================
+    if trend_activity == "no_trend":
+        # 趋势结构存在，但 ADX 明显不足
+        return False, "趋势未启动，仅观察"
+    
+    # ==================================================
     # 2️⃣ 生命周期级别硬风险
     # ==================================================
     if trend_stage == "distribution":
@@ -1985,6 +1993,8 @@ def obv_ad_trade_gate(
     # 4️⃣ 高风险量价结构（强烈压制）
     # ==================================================
     if obv_ad_label in {"高位放量分歧", "控盘减弱预警"}:
+        if trend_activity == "trend_stalling":
+            return False, "趋势停滞+资金分歧，禁止交易"
         if trend_stage == "late":
             return False, "高位资金博弈，避免参与"
         return False, "资金结构恶化，仅观察"
@@ -1995,12 +2005,18 @@ def obv_ad_trade_gate(
 
     # ---------- late：只允许最强信号 ----------
     if trend_stage == "late":
-        if obv_ad_label == "强趋势回撤":
+        if (
+            obv_ad_label == "强趋势回撤"
+            and trend_activity == "trend_active"
+        ):
             return True, "高位回撤，轻仓参与"
-        return False, "高位阶段，风险偏大"
+        return False, "高位阶段或趋势停滞，风险偏大"
 
     # ---------- mid：主升浪 ----------
     if trend_stage == "mid":
+        if trend_activity == "trend_stalling" and obv_ad_label == "趋势中资金分歧":
+            return False, "趋势停滞且资金分歧，等待确认"
+
         if obv_ad_label in {
             "明确吸筹",
             "极度缩量(隐蔽吸筹)",
@@ -2010,7 +2026,6 @@ def obv_ad_trade_gate(
             return True, "主升浪建仓/加仓"
 
         if obv_ad_label in {
-            "趋势中资金分歧",
             "底部试探",
         }:
             return True, "主升浪小仓试探"
@@ -2054,12 +2069,6 @@ def obv_ad_trade_gate(
 
 
 # =========================
-# EMA：pandas 原生，稳定、可控
-# =========================
-def compute_ema(series, span):
-    return series.ewm(span=span, adjust=False).mean()
-
-# =========================
 # ADX：用标准 Wilder 定义
 # =========================
 def compute_adx(df, period=14):
@@ -2088,6 +2097,81 @@ def compute_adx(df, period=14):
     adx = dx.rolling(period).mean()
 
     return adx
+
+
+def compute_latest_adx_from_row(
+    row,
+    price_history_map: dict,
+    period: int = 14,
+    min_bars: int = 60
+) -> float:
+    """
+    为单一股票计算“当前时刻”的 ADX 值
+    设计用于 DataFrame.apply（行级）
+    """
+
+    code = row.get("stock_code")
+    hist = price_history_map.get(code)
+
+    if hist is None or len(hist) < min_bars:
+        return float("nan")
+
+    # 只取最近一段，避免无意义的全历史计算
+    h = hist.tail(120).copy()
+
+    # 确保必要字段存在
+    required_cols = {"high", "low", "close"}
+    if not required_cols.issubset(h.columns):
+        return float("nan")
+
+    adx_series = compute_adx(h, period=period)
+
+    # 取最后一个有效 ADX
+    adx_series = adx_series.dropna()
+    if adx_series.empty:
+        return float("nan")
+
+    return float(adx_series.iloc[-1])
+
+
+def classify_trend_activity_from_row(
+    row,
+    adx_strong: float = 25,
+    adx_weak: float = 18
+) -> str:
+    """
+    二阶趋势确认（行级）
+    返回：
+    - trend_active     → 趋势真实在推进
+    - trend_stalling   → 有趋势结构，但在震荡/分歧
+    - no_trend         → 非趋势环境
+    """
+
+    trend_strength = row.get("trend_strength")
+    adx_value = row.get("adx")
+
+    if pd.isna(adx_value) or trend_strength is None:
+        return "no_trend"
+
+    # === 强趋势结构 ===
+    if trend_strength in {"strong_uptrend", "trend_pullback"}:
+        if adx_value >= adx_strong:
+            return "trend_active"
+        elif adx_value >= adx_weak:
+            return "trend_stalling"
+        else:
+            return "no_trend"
+
+    # === 普通上升趋势 ===
+    if trend_strength == "uptrend":
+        if adx_value >= adx_strong:
+            return "trend_active"
+        elif adx_value >= adx_weak:
+            return "trend_stalling"
+        else:
+            return "no_trend"
+
+    return "no_trend"
 
 
 # =========================
@@ -2214,6 +2298,79 @@ OBV_SCORE_MAP = {
     "派发阶段": 0.00           # 资金持续流出
 }
 
+# =========================
+# V3 动态量价评分模型
+# =========================
+def get_stateful_obv_score(
+    obv_label: str,
+    trend_activity: str
+) -> float:
+    """
+    根据 资金形态 × 趋势活动度 动态给分
+    """
+
+    # === 基础分（你原有逻辑，作为锚点） ===
+    base_score = OBV_SCORE_MAP.get(obv_label, 0.5)
+
+    # === 状态调制矩阵 ===
+    # 行为 × 状态 → 权重因子
+    STATE_MULTIPLIER = {
+        # ===== 明确进攻型 =====
+        "明确吸筹": {
+            "trend_active": 1.15,     # A+ 信号
+            "trend_stalling": 0.90,   # B 信号
+            "no_trend": 0.60          # 雷达
+        },
+        "极度缩量(隐蔽吸筹)": {
+            "trend_active": 1.10,
+            "trend_stalling": 1.00,   # ⭐ 这里反而不减分（VCP 常见）
+            "no_trend": 0.70
+        },
+
+        # ===== 趋势中结构 =====
+        "强趋势回撤": {
+            "trend_active": 1.05,
+            "trend_stalling": 0.85,
+            "no_trend": 0.60
+        },
+        "底部试探": {
+            "trend_active": 0.90,
+            "trend_stalling": 0.80,
+            "no_trend": 0.65
+        },
+
+        # ===== 分歧 / 高风险 =====
+        "趋势中资金分歧": {
+            "trend_active": 0.75,
+            "trend_stalling": 0.60,
+            "no_trend": 0.40
+        },
+        "高位放量分歧": {
+            "trend_active": 0.55,     # ⭐ 关键：趋势在走 ≠ 立刻死刑
+            "trend_stalling": 0.30,   # WS / CDE 的真实位置
+            "no_trend": 0.15
+        },
+        "控盘减弱预警": {
+            "trend_active": 0.45,
+            "trend_stalling": 0.25,
+            "no_trend": 0.10
+        },
+
+        # ===== 明确派发 =====
+        "派发阶段": {
+            "trend_active": 0.10,
+            "trend_stalling": 0.05,
+            "no_trend": 0.00
+        }
+    }
+
+    state_map = STATE_MULTIPLIER.get(obv_label)
+    if not state_map:
+        return base_score
+
+    multiplier = state_map.get(trend_activity, 0.6)
+    return base_score * multiplier
+
 
 def compute_trade_score(row, sector_avg_rs: dict) -> float:
     """
@@ -2224,9 +2381,10 @@ def compute_trade_score(row, sector_avg_rs: dict) -> float:
     allow_trade = row.get("allow_trade", False)
 
     # === 技术结构 ===
-    # 从 OBV_SCORE_MAP 获取基础分
-    obv_score = OBV_SCORE_MAP.get(
-        row.get("obv_ad_interpretation"), 0.5
+    # OBV 动态评分
+    obv_score = get_stateful_obv_score(
+        row.get("obv_ad_interpretation"),
+        row.get("trend_activity")
     )
 
     # 逻辑增强：引入 VCP 临门一脚的“价格紧致度”奖励
@@ -3556,7 +3714,7 @@ def main():
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    use_strict_rule = False
+    use_strict_rule = True
     stage2 = pd.DataFrame()
     if use_strict_rule:
         stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
@@ -3639,6 +3797,18 @@ def main():
         axis=1
     )
 
+    # 计算 ADX（趋势是否在“走”）
+    final_with_sim["adx"] = final_with_sim.apply(
+        lambda row: compute_latest_adx_from_row(row, price_history_map),
+        axis=1
+    )
+
+    # 基于 ADX 计算趋势活动度
+    final_with_sim["trend_activity"] = final_with_sim.apply(
+        classify_trend_activity_from_row,
+        axis=1
+    )
+
     # print("\n================ trend_strength 唯一取值全集 ================")
     # print(
     #     final_with_sim["trend_strength"]
@@ -3659,6 +3829,7 @@ def main():
             row["obv_ad_interpretation"],
             row["trend_strength"],
             row["trend_stage"],
+            row["trend_activity"]
         ),
         axis=1,
         result_type="expand"
