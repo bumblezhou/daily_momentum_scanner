@@ -1949,7 +1949,9 @@ def obv_ad_trade_gate(
     obv_ad_label: str,
     trend_strength: str,
     trend_stage: str,
-    trend_activity: str
+    trend_activity: str,
+    atr5: float,
+    atr20: float
 ):
     """
     基于 trend_strength + trend_stage + trend_activity + OBV/AD 的风险导向交易闸门
@@ -2003,8 +2005,25 @@ def obv_ad_trade_gate(
     # 5️⃣ 生命周期分阶段处理
     # ==================================================
 
+    # 波动变化率
+    # | atr5/atr20 | 市场状态             |
+    # | ---------- | ---------------- |
+    # | < 0.8      | 极度压缩（VCP / flag） |
+    # | 0.8–1.2    | 正常               |
+    # | > 1.5      | 波动扩张             |
+    # | > 2.0      | 爆发 / 新闻驱动        |
+    atr_expansion_ratio = atr5 / atr20 if atr20 > 0 else None
+
     # ---------- late：只允许最强信号 ----------
     if trend_stage == "late":
+        # 修正：如果资金在疯狂吸筹或加速，这是 Climax Run 的特征，允许参与
+        if (
+            obv_ad_label in {"明确吸筹", "趋势加速放量"}
+            and atr_expansion_ratio is not None
+            and atr_expansion_ratio < 1.6
+        ):
+            return True, "高位加速，严设止损"  # ✅ 新增逻辑：放行 NEM
+        
         if (
             obv_ad_label == "强趋势回撤"
             and trend_activity == "trend_active"
@@ -3569,7 +3588,14 @@ def classify_trend_stage(row) -> str:
             else None
         )
 
-        atr_ratio = (
+        # 波动强度（仓位 / late 判断）
+        # | atr/price | 市场含义          |
+        # | --------- | ------------- |
+        # | < 1.5%    | 稳定、适合加仓       |
+        # | 1.5%–3%   | 正常趋势          |
+        # | > 3%      | 情绪化 / 加速段     |
+        # | > 5%      | Climax / 疯狂波动 |
+        atr_price_ratio = (
             atr_15 / close
             if atr_15 and atr_15 > 0
             else None
@@ -3594,18 +3620,31 @@ def classify_trend_stage(row) -> str:
 
         if distribution_conditions >= 2:
             return "distribution"
+        
+        # 在 classify_trend_stage 函数的开头加入特权判断
+        price_tightness = float(row.get("price_tightness", 1.0))
+        # 豁免逻辑：如果是紧致的高位旗形，不算 Late，算 Mid (最佳买点)
+        if (trend_strength == "strong_uptrend" 
+            and price_tightness < 0.06 
+            and dist_to_52w_high < 0.05):
+            return "mid"
 
         # ======================================================
         # 5️⃣ late stage（强趋势后段：位置 + 乖离 + 波动）
         # ======================================================
+        # 原逻辑
+        # and ma20_dist > 0.06
+        # 修改后逻辑：
+        # 对于超级强势股(RS>90)，允许更大的乖离率才算 Late
+        threshold = 0.12 if (rs_rank and rs_rank > 90) else 0.08
         if (
             trend_strength == "strong_uptrend"
             and dist_to_52w_high is not None
             and dist_to_52w_high < 0.03
             and ma20_dist is not None
-            and ma20_dist > 0.06
-            and atr_ratio is not None
-            and atr_ratio > 0.03
+            and ma20_dist > threshold  # <--- 使用动态阈值
+            and atr_price_ratio is not None
+            and atr_price_ratio > 0.03
         ):
             return "late"
 
@@ -3656,7 +3695,7 @@ def fetch_current_vix():
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "CDE", "BMY", "ATMU"]
+CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "CDE", "BMY", "ATMU", "ATMU", "JOE", "TPB"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -3666,7 +3705,7 @@ def main():
     # ticker_df = fetch_us_tickers()
     # upsert_stock_tickers(ticker_df)
 
-    # 2️⃣ State 1: B, yfinance 批量加载所有1800左右流动股的价格
+    # 2️⃣ State 1: B, yfinance 批量加载所有4600左右流动股的价格
     # 首次执行时解开注释执行，以后每天轮动不用再执行
     # fetch_all_prices()
 
@@ -3714,7 +3753,7 @@ def main():
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    use_strict_rule = True
+    use_strict_rule = False
     stage2 = pd.DataFrame()
     if use_strict_rule:
         stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
@@ -3829,7 +3868,9 @@ def main():
             row["obv_ad_interpretation"],
             row["trend_strength"],
             row["trend_stage"],
-            row["trend_activity"]
+            row["trend_activity"],
+            row["atr5"],
+            row["atr20"]
         ),
         axis=1,
         result_type="expand"
