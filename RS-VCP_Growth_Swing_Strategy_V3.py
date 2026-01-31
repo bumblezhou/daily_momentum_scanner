@@ -492,7 +492,8 @@ def update_recent_prices(watchlist: list = []):
 # ============================================================
 # Stage 2：SwingTrend 技术筛选（全部在 DuckDB 内完成）
 # ============================================================
-def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], market_regime: str = "多头") -> pd.DataFrame:
+def build_stage2_swingtrend(target_date: date, monitor_list: list = [], market_regime: str = "多头") -> pd.DataFrame:
+    con = duckdb.connect(DUCKDB_PATH)
     if market_regime == "多头":
         market_filter_sql = """
             /* =====================================================
@@ -847,10 +848,11 @@ def build_stage2_swingtrend(con, target_date: date, monitor_list: list = [], mar
     """
 
     df = con.execute(sql).df()
+    con.close()
     return df
 
 
-def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], market_regime: str = "多头"):
+def build_stage2_swingtrend_balanced(target_date, monitor_list: list = [], market_regime: str = "多头"):
     """
     平衡版：介于标准版和应急版之间
     
@@ -863,7 +865,8 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
     
     预期筛选：50-150支股票
     """
-    
+    con = duckdb.connect(DUCKDB_PATH)
+
     monitor_str = ", ".join([f"'{t}'" for t in monitor_list]) if monitor_list else "''"
     
     if market_regime == "多头":
@@ -1132,6 +1135,7 @@ def build_stage2_swingtrend_balanced(con, target_date, monitor_list: list = [], 
     """
     
     df = con.execute(sql).df()
+    con.close()
     return df
 
 
@@ -1573,24 +1577,25 @@ def fundamental_consumer():
 
 
 # 编写“增量更新”脚本（扩展为 CAN SLIM）
-def update_fundamentals(con, ticker_list, force_update=False):
+def update_fundamentals(ticker_list, force_update=False):
     """
     定期更新基本面数据，包括 CAN SLIM 特定指标
     force_update: 是否强制更新所有股票，否则只更新过期数据
     """
-
+    con = duckdb.connect(DUCKDB_PATH)
     init_fundamental_table(con)
 
     # 1. 找出需要更新的 Tickers
     if force_update:
         need_update = ticker_list
     else:
-        # 找出库里没有的，或者更新时间超过 7 天的
-        existing = con.execute("""
+        # 1. 识别已更新的股票：在过去 7 天内未更新过的
+        recent_tickers = con.execute("""
             SELECT stock_code FROM stock_fundamentals 
-            WHERE update_date >= CURRENT_DATE
+            WHERE update_date > CURRENT_DATE - INTERVAL '7 days'
         """).df()['stock_code'].tolist()
-        need_update = [t for t in ticker_list if t not in existing]
+        # 2. 差集计算：不在 recent_tickers 里的才需要更新
+        need_update = [t for t in ticker_list if t not in recent_tickers]
 
     if not need_update:
         print("✅ 所有基本面数据均在有效期内，无需更新。")
@@ -1612,6 +1617,8 @@ def update_fundamentals(con, ticker_list, force_update=False):
     
     fundamental_queue.put(STOP_SIGNAL)
     consumer_thread.join()
+
+    con.close()
     print(f"✅ 基本面数据更新完成，共更新 {update_count} 只股票。")
 
 
@@ -1694,7 +1701,7 @@ def simulate_pullback_range(con, stock_code, current_vix=18.0):
     }
 
 
-def check_market_regime(con) -> dict:
+def check_market_regime() -> dict:
     """
     检查市场整体形态（Market Regime）
     规则：
@@ -1710,6 +1717,7 @@ def check_market_regime(con) -> dict:
         "qqq_ma50": float
     }
     """
+    con = duckdb.connect(DUCKDB_PATH)
 
     spy_sql = """
         SELECT close, ma200
@@ -1762,6 +1770,8 @@ def check_market_regime(con) -> dict:
 
     is_bull = (spy_close > spy_ma200) and (qqq_close > qqq_ma50) and (rsi < 70)  # 避免超买
 
+    con.close
+
     return {
         "is_bull": is_bull,
         "spy_close": spy_close,
@@ -1771,7 +1781,8 @@ def check_market_regime(con) -> dict:
     }
 
 
-def update_volume_trend_features(con, latest_trading_day: str):
+def update_volume_trend_features(latest_trading_day: str):
+    con = duckdb.connect(DUCKDB_PATH)
     con.execute(f"""
         DELETE FROM stock_volume_trend
         WHERE trade_date = DATE '{latest_trading_day}'
@@ -1857,6 +1868,7 @@ def update_volume_trend_features(con, latest_trading_day: str):
         w60 AS (PARTITION BY stock_code ORDER BY trade_date ROWS 59 PRECEDING)
     """
     con.execute(sql)
+    con.close()
 
 
 # =========================
@@ -2637,13 +2649,14 @@ def resolve_option_sentiment_state(row) -> OptionSentimentState:
     return OptionSentimentState.NEUTRAL
 
 
-def check_data_integrity(con):
+def check_data_integrity():
     """
     检查数据库数据完整性
     """
     print("\n" + "="*80)
     print("🔍 数据完整性检查")
     print("="*80)
+    con = duckdb.connect(DUCKDB_PATH)
     
     # 1. 检查ticker表
     ticker_count = con.execute("""
@@ -2738,10 +2751,11 @@ def check_data_integrity(con):
         # 🔥 选项3：继续运行（默认）
         print("⏭️  继续使用现有数据运行...")
     
+    con.close()
     return latest_price_count
 
 
-def diagnose_stage2_filters(con, target_date):
+def diagnose_stage2_filters(target_date):
     """
     修复后的诊断函数 - 使用正确的f-string格式化
     """
@@ -2749,6 +2763,8 @@ def diagnose_stage2_filters(con, target_date):
     print("\n" + "="*80)
     print("🔍 Stage2 筛选条件诊断报告")
     print("="*80)
+
+    con = duckdb.connect(DUCKDB_PATH)
     
     # 🔥 修复：使用f-string格式化所有SQL
     total_sql = f"""
@@ -2954,6 +2970,8 @@ def diagnose_stage2_filters(con, target_date):
             print(f"\n✗ {name}")
             print(f"  错误: {str(e)[:100]}")
     
+    con.close()
+    
     print("\n" + "="*80)
     print("💡 建议：")
     print("-"*80)
@@ -2985,7 +3003,6 @@ def reset_yf_availability():
 
 
 def load_all_price_data(
-    con=None,
     min_date: str | None = None
 ) -> pd.DataFrame:
     """
@@ -2993,6 +3010,7 @@ def load_all_price_data(
     - 只做一件事：加载所有可用价格数据
     - 不筛选、不判断、不加工
     """
+    con = duckdb.connect(DUCKDB_PATH)
 
     where_clause = ""
     if min_date:
@@ -3020,17 +3038,16 @@ def load_all_price_data(
 
     df["trade_date"] = pd.to_datetime(df["trade_date"])
 
+    con.close()
+
     return df
 
 
-def build_price_history_map(
-    con,
-    min_bars: int = 60
-) -> dict:
+def build_price_history_map(min_bars: int = 60) -> dict:
     """
     构建股票 → 历史行情映射（实盘安全）
     """
-    price_df = load_all_price_data(con)
+    price_df = load_all_price_data()
 
     required_cols = {"stock_code", "trade_date", "close"}
 
@@ -3695,7 +3712,7 @@ def fetch_current_vix():
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["GOOG", "TLSA", "AMD", "NEM", "CDE", "BMY", "ATMU", "ATMU", "JOE", "TPB"]
+CURRENT_SELECTED_TICKERS = ["CDE", "BMY", "AMTM", "APG", "TPB"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -3716,21 +3733,15 @@ def main():
     # 新增：确保SPY和QQQ数据更新，用于Market Regime Filter
     update_recent_prices(CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"])
 
-    # 连接数据库
-    con = duckdb.connect(DUCKDB_PATH)
-
     # 构建价格历史映射
-    price_history_map = build_price_history_map(
-        con=con,
-        min_bars=60
-    )
+    price_history_map = build_price_history_map(min_bars=60)
 
     # 更新基本面数据
     print(f"🚀 Stage 1: 更新最新的基本面数据")
-    update_fundamentals(con, get_tickers_missing_recent_fundamentals(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=False)
+    update_fundamentals(get_tickers_missing_recent_fundamentals(get_recent_trading_days_smart(10)) + CURRENT_SELECTED_TICKERS + ["SPY", "QQQ"], force_update=False)
 
     # 🔥 新增：先检查数据完整性
-    check_data_integrity(con)
+    check_data_integrity()
 
     # 🚀 修复点：自动获取库中最新的交易日期
     latest_date_in_db = get_latest_date_in_db()
@@ -3741,24 +3752,24 @@ def main():
     # 新增：建议3 - Market Regime Filter
     # SPY > MA200 AND QQQ > MA50，否则不交易
     print("🔍 检查市场 Regime...")
-    regime = check_market_regime(con)
+    regime = check_market_regime()
     market_regime = "多头" if regime.get("is_bull", False) else "非多头"
     print(f"市场形态判定: {market_regime}")
 
     # 🔥 新增：运行诊断
-    # diagnose_stage2_filters(con, latest_date_in_db)
+    # diagnose_stage2_filters(latest_date_in_db)
 
     # 更新量价趋势特征表
-    update_volume_trend_features(con, latest_date_in_db)
+    update_volume_trend_features(latest_date_in_db)
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    use_strict_rule = False
+    use_strict_rule = True
     stage2 = pd.DataFrame()
     if use_strict_rule:
-        stage2 = build_stage2_swingtrend(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+        stage2 = build_stage2_swingtrend(latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     else:
-        stage2 = build_stage2_swingtrend_balanced(con, latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
+        stage2 = build_stage2_swingtrend_balanced(latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
     print(f"Stage 2 股票数量: {len(stage2)}")
 
     # if stage2.empty:
@@ -3803,9 +3814,6 @@ def main():
 
     final_with_sim = final_with_sim.query("entry_price.notna()")
     print(f"按必须包含买入价【entry_price】过滤后股票总数: {len(final_with_sim)}")
-    
-    # 关闭连接
-    con.close()
 
     for col in ["obv_slope_20", "obv_slope_5", "ad_slope_20", "ad_slope_5", "vol_rs_vcp", "price_tightness"]:
         final_with_sim[col] = final_with_sim[col].fillna(0.0)
