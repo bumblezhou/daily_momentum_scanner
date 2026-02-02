@@ -3791,10 +3791,10 @@ def main():
     # 暂时降低过滤门槛以确保有输出
     final_filtered = (
         final
-        .query("market_cap >= 1_000_000_000 and quarterly_eps_growth.notna()")
+        .query("market_cap >= 500_000_000 and quarterly_eps_growth.notna()")
         .sort_values(["canslim_score", "rs_rank", "is_current_hold"], ascending=False)
     )
-    print(f"按市值【10亿美元】和季度每股收益增长【quarterly_eps_growth】过滤后股票总数: {len(final_filtered)}")
+    print(f"按市值【5亿美元】和季度每股收益增长【quarterly_eps_growth】过滤后股票总数: {len(final_filtered)}")
 
     # 5️⃣ 集成 VWAP 和盘前高点
     print("\n🔍 正在获取 VWAP 和盘前高点数据...")
