@@ -3712,7 +3712,7 @@ def fetch_current_vix():
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE", "BMY", "AMTM", "APG", "TPB"]
+CURRENT_SELECTED_TICKERS = ["CDE", "BMY", "AMTM", "TPB", "JOE"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -3791,10 +3791,10 @@ def main():
     # 暂时降低过滤门槛以确保有输出
     final_filtered = (
         final
-        .query("market_cap >= 500_000_000 and quarterly_eps_growth.notna()")
+        .query("market_cap >= 1_000_000_000 and quarterly_eps_growth.notna()")
         .sort_values(["canslim_score", "rs_rank", "is_current_hold"], ascending=False)
     )
-    print(f"按市值【5亿美元】和季度每股收益增长【quarterly_eps_growth】过滤后股票总数: {len(final_filtered)}")
+    print(f"按市值【10亿美元】和季度每股收益增长【quarterly_eps_growth】过滤后股票总数: {len(final_filtered)}")
 
     # 5️⃣ 集成 VWAP 和盘前高点
     print("\n🔍 正在获取 VWAP 和盘前高点数据...")
@@ -3812,8 +3812,8 @@ def main():
         current_vix=current_vix
     )
 
-    final_with_sim = final_with_sim.query("entry_price.notna()")
-    print(f"按必须包含买入价【entry_price】过滤后股票总数: {len(final_with_sim)}")
+    # final_with_sim = final_with_sim.query("entry_price.notna()")
+    # print(f"按必须包含买入价【entry_price】过滤后股票总数: {len(final_with_sim)}")
 
     for col in ["obv_slope_20", "obv_slope_5", "ad_slope_20", "ad_slope_5", "vol_rs_vcp", "price_tightness"]:
         final_with_sim[col] = final_with_sim[col].fillna(0.0)
