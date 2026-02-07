@@ -14,6 +14,7 @@ import threading
 import queue
 import numpy as np
 from enum import Enum
+from openpyxl import load_workbook
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -2479,6 +2480,27 @@ def compute_trade_score(row, sector_avg_rs: dict) -> float:
         base_score *= 0.6
 
     final_score = max(0.0, min(base_score * 100, 100.0))
+
+    # === 终极硬风险修正（交易状态） ===
+    trade_state = row.get("trade_state")
+    if "禁止交易" in trade_state:
+        final_score = min(final_score, 40)
+    elif "阶段不明" in trade_state:
+        final_score = min(final_score, 75)
+    elif "非趋势结构" in trade_state:
+        final_score = min(final_score, 65)
+    
+    # ====== 主升浪 + 极强 RS 的 score 上限释放 ======
+    trend_stage = row.get("trend_stage")
+    rs_rank = row.get("rs_rank")
+    if (
+        trade_state == "主升浪建仓/加仓"
+        and rs_rank is not None
+        and rs_rank >= 95
+        and trend_stage == "mid"
+    ):
+        final_score = max(final_score, 80)
+
     return round(final_score, 2)
 
 
@@ -3710,9 +3732,80 @@ def fetch_current_vix():
     return current_vix
 
 
+# ===================== 字段中文映射 =====================
+COLUMN_CN_MAP = {
+    "is_current_hold": "是否持仓",
+    "stock_code": "股票代码",
+    "close": "最新收盘价",
+
+    "ideal_entry": "理想买入区",
+    "entry_price": "参考入场价",
+    "hard_stop": "硬止损价",
+
+    "target_profit": "目标止盈价",
+    "rs_rank": "相对强度RS",
+    "canslim_score": "CANSLIM评分",
+
+    "quarterly_eps_growth": "季度EPS增长率",
+    "annual_eps_growth": "年度EPS增长率",
+    "revenue_growth": "营收增长率",
+    "roe": "ROE",
+
+    "shares_outstanding": "流通股本",
+    "inst_ownership": "机构持仓",
+    "fcf_quality": "自由现金流质量",
+    "market_cap": "市值",
+    "sector": "行业",
+
+    "trade_state": "交易阶段",
+    "trade_score": "综合评分",
+    "obv_ad_interpretation": "量价解读",
+
+    "trend_strength": "趋势强度",
+    "trend_stage": "趋势阶段",
+    "option_state_cn": "期权结构"
+}
+
+
+def autosize_excel_columns(file_path, sheet_name=None, min_width=10, max_width=40):
+    wb = load_workbook(file_path)
+    ws = wb[sheet_name] if sheet_name else wb.active
+
+    for column_cells in ws.columns:
+        max_length = 0
+        column_letter = column_cells[0].column_letter
+
+        for cell in column_cells:
+            if cell.value is not None:
+                max_length = max(max_length, len(str(cell.value)))
+
+        adjusted_width = min(max(max_length + 2, min_width), max_width)
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    wb.save(file_path)
+
+
+# ====== trade_state → 最大允许仓位映射 ======
+TRADE_STATE_MAX_POSITION = {
+    "主升浪建仓/加仓": 1.00,
+
+    "阶段不明，小仓试探": 0.30,
+    "阶段不明，仅观察": 0.20,
+
+    "趋势未启动，仅观察": 0.20,
+    "非趋势结构，仅观察": 0.15,
+    "量价支持不足": 0.15,
+
+    "资金结构恶化，仅观察": 0.10,
+
+    "趋势停滞+资金分歧，禁止交易": 0.00,
+    "资金明确派发，禁止交易": 0.00,
+}
+
+
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["CDE", "BMY", "AMTM", "TPB", "JOE"]
+CURRENT_SELECTED_TICKERS = ["AVGO", "AMTM", "CDE", "MEM", "GOOG", "TLSA", "MU", "TXN", "AMAT", "INTC", "AMD", "PLTR", "SMCI"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -3764,7 +3857,7 @@ def main():
 
     # 4️⃣ Stage 2: SwingTrend 技术筛选
     print(f"🚀 Stage 2: SwingTrend 技术筛选 (包含监控名单: {CURRENT_SELECTED_TICKERS})")
-    use_strict_rule = True
+    use_strict_rule = False
     stage2 = pd.DataFrame()
     if use_strict_rule:
         stage2 = build_stage2_swingtrend(latest_date_in_db, monitor_list=CURRENT_SELECTED_TICKERS, market_regime=market_regime)
@@ -3931,12 +4024,15 @@ def main():
         "ideal_entry", "entry_price", "hard_stop",
         "target_profit", "rs_rank","canslim_score",
         "quarterly_eps_growth", "annual_eps_growth",
-        "revenue_growth", "roe", "shares_outstanding", 
-        "inst_ownership", "fcf_quality", "market_cap", 'sector', 
+        "revenue_growth", "roe", "inst_ownership", 
+        "fcf_quality", "market_cap", 'sector', 
         'trade_state', 'trade_score', 'obv_ad_interpretation', 
         'trend_strength', 'trend_stage', 'option_state_cn'
     ]
-    print(final_with_sim[display_cols].to_string(index=False))
+    display_cols_cn = [COLUMN_CN_MAP[col] for col in display_cols]
+    final_with_sim = final_with_sim[display_cols].copy()
+    final_with_sim.columns = display_cols_cn
+    print(final_with_sim[display_cols_cn].to_string(index=False))
 
     # 保存结果
     if not final_with_sim.empty:
@@ -3946,13 +4042,14 @@ def main():
         else:
             file_name_xlsx = f"swing_strategy_vix_sim_balanced_{datetime.now():%Y%m%d}.xlsx"
         try:
-            final_with_sim[display_cols].to_excel(file_name_xlsx, index=False, engine='openpyxl')
+            final_with_sim[display_cols_cn].to_excel(file_name_xlsx, index=False, engine='openpyxl')
+            autosize_excel_columns(file_name_xlsx)
             print(f"\n📊 详细策略报告已生成 Excel: {file_name_xlsx}")
         except Exception as e:
             print(f"❌ Excel 生成失败 (请检查是否安装 openpyxl): {e}")
             # 备选保存为 CSV
             file_name_csv = file_name_xlsx.replace(".xlsx", ".csv")
-            final_with_sim[display_cols].to_csv(file_name_csv, index=False, encoding="utf-8-sig")
+            final_with_sim[display_cols_cn].to_csv(file_name_csv, index=False, encoding="utf-8-sig")
             print(f"\n📊 详细策略报告已生成: {file_name_csv}")
     else:
         print("⚠️ 经过基本面严格筛选后，没有符合条件的股票。")
