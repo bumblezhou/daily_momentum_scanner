@@ -887,8 +887,14 @@ def build_stage2_swingtrend_balanced(target_date, monitor_list: list = [], marke
                 AND r.rs_rank >= 65  -- 前35%
                 AND r.rs_20 >= r.rs_20_10days_ago * 0.88  -- RS不能明显走弱
                 
-                /* ===== 4. VCP收缩（略微放宽）===== */
-                AND (a.atr5 / NULLIF(a.atr20, 0)) < 1.10
+                /* ===== 4. VCP收缩（核心修改：大市值放宽）===== */
+                AND (
+                    /* 大市值（≥1000亿美元）放宽到 < 1.05 */
+                    (f.market_cap >= 100000000000 AND (a.atr5 / NULLIF(a.atr20, 0)) < 1.05)
+                    OR
+                    /* 小市值保持原要求 < 1.10 */
+                    (f.market_cap < 100000000000 AND (a.atr5 / NULLIF(a.atr20, 0)) < 1.10)
+                )
                 AND a.atr15 <= a.atr60 * 1.05
                 
                 /* ===== 5. 成交量（标准）===== */
@@ -1964,7 +1970,8 @@ def obv_ad_trade_gate(
     trend_stage: str,
     trend_activity: str,
     atr5: float,
-    atr20: float
+    atr20: float,
+    market_cap: float
 ):
     """
     基于 trend_strength + trend_stage + trend_activity + OBV/AD 的风险导向交易闸门
@@ -2021,6 +2028,17 @@ def obv_ad_trade_gate(
     # | > 1.5      | 波动扩张             |
     # | > 2.0      | 爆发 / 新闻驱动        |
     atr_expansion_ratio = atr5 / atr20 if atr20 > 0 else None
+    
+    # 大市值判断（与Stage 2一致）
+    is_large_cap = False
+    try:
+        market_cap = market_cap if market_cap else None
+        is_large_cap = market_cap is not None and market_cap >= 100000000000  # ≥1000亿美元
+    except:
+        pass
+
+    # late stage 阈值动态化
+    late_atr_threshold = 1.80 if is_large_cap else 1.60
 
     # ---------- late：高位只允许“强中强” ----------
     if trend_stage == "late":
@@ -2028,7 +2046,7 @@ def obv_ad_trade_gate(
         if (
             obv_ad_label in {"明确吸筹", "趋势加速放量"}
             and atr_expansion_ratio is not None
-            and atr_expansion_ratio < 1.6
+            and atr_expansion_ratio < late_atr_threshold
         ):
             return True, "高位加速，严设止损"
         
@@ -3099,12 +3117,6 @@ def build_price_history_map(min_bars: int = 60) -> dict:
     return price_history_map
 
 
-def is_price_reasonable(high_series, last_close, max_ratio=1.5):
-    if last_close is None or last_close <= 0:
-        return True
-    return high_series.max() <= last_close * max_ratio
-
-
 def get_us_trading_date(latest_date_in_db):
     """
     根据美东时间 + 数据库最新交易日，判断当前应使用的美股交易日
@@ -3249,8 +3261,8 @@ def get_vwap_and_premarket_high(ticker, target_date):
                 premarket_high = high_pm.max()
             
             last_close = regular["close"].iloc[-1] if not regular.empty else None
-            if not is_price_reasonable(high_pm, last_close):
-                premarket_high = None
+            if last_close and (premarket_high > last_close * 1.15 or premarket_high < last_close * 0.7):
+                premarket_high = None  # 异常值丢弃
 
         print(
             f"[获取VWAP数据成功] {ticker}: "
@@ -3514,6 +3526,10 @@ def apply_entry_stop_target_vix(
         low_5d = row.get("low_5d")
         trend_strength = row.get("trend_strength", "unknown")
         rs_rank = row.get("rs_rank", 0)
+        
+        # 判断 vwap 是否正常，不正常就用close替代
+        vwap_valid = (vwap > 0) and (vwap <= close * 1.5) and (vwap >= close * 0.5)
+        vwap = vwap if vwap_valid else close
 
         # === ATR 兜底 ===
         if atr is None or atr <= 0:
@@ -3677,6 +3693,16 @@ def classify_trend_stage(row) -> str:
         # and ma20_dist > 0.06
         # 修改后逻辑：
         # 对于超级强势股(RS>90)，允许更大的乖离率才算 Late
+        # 大市值判断
+        is_large_cap = False
+        try:
+            market_cap = row.get("market_cap") if "market_cap" in row else None
+            is_large_cap = market_cap is not None and market_cap >= 100000000000
+        except:
+            pass
+
+        # late stage 阈值动态化：大市值允许更大波动才算 late（不易过早判晚期）
+        late_atr_threshold = 0.045 if is_large_cap else 0.03
         threshold = 0.12 if (rs_rank and rs_rank > 90) else 0.08
         if (
             trend_strength == "strong_uptrend"
@@ -3685,7 +3711,7 @@ def classify_trend_stage(row) -> str:
             and ma20_dist is not None
             and ma20_dist > threshold  # <--- 使用动态阈值
             and atr_price_ratio is not None
-            and atr_price_ratio > 0.03
+            and atr_price_ratio > late_atr_threshold
         ):
             return "late"
 
@@ -3951,18 +3977,6 @@ def main():
         axis=1
     )
 
-    # print("\n================ trend_strength 唯一取值全集 ================")
-    # print(
-    #     final_with_sim["trend_strength"]
-    #     .value_counts(dropna=False)
-    # )
-    # print("==============================================================")
-    # print("\n🔍 trend_strength 样本（前 10 条）")
-    # print(
-    #     final_with_sim[["stock_code", "trend_strength"]]
-    #     .head(10)
-    # )
-
     # =========================
     # V3：应用量价交易 Gate
     # =========================
@@ -3973,7 +3987,8 @@ def main():
             row["trend_stage"],
             row["trend_activity"],
             row["atr5"],
-            row["atr20"]
+            row["atr20"],
+            row["market_cap"]
         ),
         axis=1,
         result_type="expand"
