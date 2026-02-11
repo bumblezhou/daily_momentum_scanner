@@ -3528,7 +3528,7 @@ def apply_entry_stop_target_vix(
         rs_rank = row.get("rs_rank", 0)
         
         # 判断 vwap 是否正常，不正常就用close替代
-        vwap_valid = (vwap > 0) and (vwap <= close * 1.5) and (vwap >= close * 0.5)
+        vwap_valid = (vwap > 0) and (vwap <= close * 1.5) and (vwap >= close * 0.5) if vwap is not None else False
         vwap = vwap if vwap_valid else close
 
         # === ATR 兜底 ===
@@ -3833,7 +3833,7 @@ TRADE_STATE_MAX_POSITION = {
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["AVGO", "AMTM", "CDE", "ORCL", "MEM", "GOOG", "TLSA", "MU", "TXN", "AMAT", "INTC", "AMD", "PLTR"]
+CURRENT_SELECTED_TICKERS = ["AVGO", "AMTM", "CDE", "ORCL", "MEM", "GOOG", "TLSA", "MU", "NVO", "AMAT", "INTC", "AMD", "PLTR"]
 # ===============================================
 
 # ===================== 主流程 =====================
