@@ -2289,9 +2289,15 @@ def classify_trend_activity_from_row(
 
     trend_strength = row.get("trend_strength")
     adx_value = row.get("adx")
+    market_cap = row.get("market_cap", 0)
 
     if pd.isna(adx_value) or trend_strength is None:
         return "no_trend"
+    
+    # 大市值特权：市值大于 5000 亿美金，ADX 门槛大幅降低
+    if market_cap is not None and market_cap >= 5e11:
+        adx_strong = 18  # 巨头有18的ADX就已经很强了
+        adx_weak = 12
 
     # === 强趋势结构 ===
     if trend_strength in {"strong_uptrend", "trend_pullback"}:
@@ -2377,8 +2383,8 @@ def compute_trend_strength_from_row(
     if (
         last_close > last_ma20 > last_ma50
         and (last_ma200 is None or last_ma50 > last_ma200)
-        and ma20_slope > 0.01
-        and ma50_slope > 0.005
+        and ma20_slope > 0.003   # 原来是 0.01，大盘股 5 天涨 1% 太苛刻，改为 0.3%
+        and ma50_slope > 0.002   # 原来是 0.005，改为 0.2%
     ):
         return "strong_uptrend"
 
@@ -3847,11 +3853,11 @@ def classify_trend_stage(row) -> str:
         # 6️⃣ mid stage（主升浪：最优 Swing 区）
         # ======================================================
         if (
-            trend_strength == "strong_uptrend"
+            trend_strength in {"strong_uptrend", "uptrend"}  # 允许 uptrend 进入
             and dist_to_52w_high is not None
-            and 0.03 <= dist_to_52w_high <= 0.20
+            and 0.00 <= dist_to_52w_high <= 0.20             # 允许距离高点很近 (从 0.03 改为 0.00)
             and ma20_dist is not None
-            and 0.01 <= ma20_dist <= 0.05
+            and 0.00 <= ma20_dist <= 0.08                    # 放宽 ma20 偏离度要求
         ):
             return "mid"
 
