@@ -87,7 +87,9 @@ def init_db():
             vol_rs DOUBLE,
             vol50 DOUBLE,
             vol_rs_vcp DOUBLE,
-            price_tightness DOUBLE
+            price_tightness DOUBLE,
+            vol_spike_ratio DOUBLE,
+            daily_change_pct DOUBLE
         )
     """);
     con.close()
@@ -811,6 +813,8 @@ def build_stage2_swingtrend(target_date: date, monitor_list: list = [], market_r
         vt.vol50,
         vt.vol_rs_vcp,
         vt.price_tightness,
+        vt.vol_spike_ratio,  -- 量比
+        vt.daily_change_pct, -- 当日价格变动波幅(%)
         f.canslim_score,
         f.quarterly_eps_growth,
         f.annual_eps_growth,
@@ -1107,6 +1111,8 @@ def build_stage2_swingtrend_balanced(target_date, monitor_list: list = [], marke
         vt.vol50,
         vt.vol_rs_vcp,
         vt.price_tightness,
+        vt.vol_spike_ratio,  -- 量比
+        vt.daily_change_pct, -- 当日价格变动波幅(%)
         f.canslim_score,
         f.quarterly_eps_growth,
         f.annual_eps_growth,
@@ -1169,7 +1175,8 @@ def init_fundamental_table(con):
             opt_uoa_score DOUBLE DEFAULT 0,           -- 异常期权强度（0~1）,下注规模
             opt_uoa_call_bias DOUBLE DEFAULT 0,       -- 异常期权方向偏好：>0 偏多，<0 偏空
             opt_uoa_avg_dte DOUBLE DEFAULT NULL,      -- 异常期权平均到期天数或下注周期：判断是事件还是趋势
-            opt_uoa_type VARCHAR DEFAULT NULL         -- 异常期权行为分类（institutional / event / noise）
+            opt_uoa_type VARCHAR DEFAULT NULL,        -- 异常期权行为分类（institutional / event / noise）
+            next_earnings_date DATE DEFAULT NULL      -- 下一次财报日期
         );
     """)
 
@@ -1435,6 +1442,40 @@ def load_fundamentals_by_yf(symbol):
         # 提取期权情绪数据
         option_sentiment = extract_option_sentiment_from_yf(t)
 
+        # 获取下一次财报日期
+        next_earnings_date = None
+        try:
+            cal = t.calendar
+            # 1. 如果是 DataFrame
+            if cal is not None and isinstance(cal, pd.DataFrame) and not cal.empty:
+                if 'Earnings Date' in cal.index:
+                    row_data = cal.loc['Earnings Date']
+                    if len(row_data) > 0:
+                        next_earnings_date = row_data.iloc[0]
+                elif 0 in cal.index:
+                    next_earnings_date = cal.iloc[0, 0]
+            
+            # 2. 如果是字典 (针对 TIRX, HVMC 等报错点的修复)
+            elif isinstance(cal, dict) and 'Earnings Date' in cal:
+                e_list = cal['Earnings Date']
+                if isinstance(e_list, list) and len(e_list) > 0:
+                    next_earnings_date = e_list[0]
+            
+            # 3. 方法B：如果 A 失败，尝试从 info 获取时间戳
+            if not next_earnings_date:
+                ts = info.get('earningsTimestamp') or info.get('earningsTimestampStart')
+                if ts:
+                    next_earnings_date = datetime.fromtimestamp(ts).date()
+            
+            # 统一转换为 date 对象
+            if isinstance(next_earnings_date, (datetime, pd.Timestamp)):
+                next_earnings_date = next_earnings_date.date()
+                
+        except Exception as e_cal:
+            # 即使获取日期失败，也不要中断整个基本面的抓取
+            print(f"财报日期解析跳过 {symbol}: {e_cal}") 
+            next_earnings_date = None
+
         # === 期权 UOA（结构化） ===
         uoa_struct = extract_uoa_structured_from_yf(t)
 
@@ -1510,6 +1551,7 @@ def load_fundamentals_by_yf(symbol):
         fundamentals_info["opt_uoa_call_bias"] = opt_uoa_call_bias
         fundamentals_info["opt_uoa_avg_dte"] = opt_uoa_avg_dte
         fundamentals_info["opt_uoa_type"] = opt_uoa_type
+        fundamentals_info["next_earnings_date"] = next_earnings_date
     except Exception as e:
         # 捕获可能的限流异常
         if "429" in str(e):
@@ -1526,7 +1568,7 @@ def fundamental_consumer():
     
     SQL_INSERT_FUNDAMENTAL = """
         INSERT OR REPLACE INTO stock_fundamentals 
-        VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     sector_buffer = []
     SQL_INSERT_SECTOR = """
@@ -1541,7 +1583,8 @@ def fundamental_consumer():
             break
 
         # 逐行获取fundamental数据
-        fundamental_buffer.append((info.get("symbol"), 
+        fundamental_buffer.append((
+            info.get("symbol"), 
             info.get("quarterly_eps_growth"), 
             info.get("annual_eps_growth"), 
             info.get("rev_growth"), 
@@ -1558,7 +1601,9 @@ def fundamental_consumer():
             info.get("opt_uoa_score"),
             info.get("opt_uoa_call_bias"),
             info.get("opt_uoa_avg_dte"),
-            info.get("opt_uoa_type")))
+            info.get("opt_uoa_type"),
+            info.get("next_earnings_date")
+        ))
         # 逐行获取sector数据
         sector_buffer.append((info.get("sector"), info.get("industry"), info.get("symbol")))
 
@@ -1837,7 +1882,10 @@ def update_volume_trend_features(latest_trading_day: str):
             SUM(ad_delta) OVER w AS ad,
 
             /* ===== avg_vol_20 ===== */
-            AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) as avg_vol_20
+            AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) as avg_vol_20,
+
+            /* ===== 计算价格绝对涨跌幅 ===== */
+            ABS((close - LAG(close) OVER w) / NULLIF(LAG(close) OVER w, 0)) as daily_change_pct
         FROM base
         WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
     ),
@@ -1863,7 +1911,12 @@ def update_volume_trend_features(latest_trading_day: str):
             
             -- 计算紧致度 (Price Tightness)
             (MAX(high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 4 PRECEDING) - 
-            MIN(low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 4 PRECEDING)) / NULLIF(close, 0) as price_tightness
+            MIN(low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 4 PRECEDING)) / NULLIF(close, 0) as price_tightness,
+
+            -- 当日量比 (Volume Spike)
+            volume / NULLIF(AVG(volume) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS 20 PRECEDING), 0) as vol_spike_ratio,
+            -- 日价格变动幅度(百分比)
+            daily_change_pct
         FROM obv_ad
     )
 
@@ -1880,26 +1933,29 @@ def update_volume_trend_features(latest_trading_day: str):
 
 # =========================
 # V3 新增：量价形势判定
-# | obv_ad_label        | 资金行为本质        | 风险等级 |
-# | ------------        | -------------      | -------- |
-# | 极度缩量(隐蔽吸筹)    | 隐蔽建仓（VCP/WWD） | 🟢 低   |
-# | 明确吸筹             | 主动进攻            | 🟢 低   |
-# | 趋势加速放量         | 趋势加速            | 🟢 低   |
-# | 强趋势回撤           | 洗盘 / 换手         | 🟢 低~中 |
-# | 底部试探             | 早期试水            | 🟡 中   |
-# | 趋势中资金分歧        | 多空未统一          | 🟡 中   |
-# | 量价中性             | 无信息              | 🟡 中   |
-# | 高位放量分歧          | 高位博弈            | 🔴 高   |
-# | 控盘减弱预警          | 主力松动            | 🔴 高   |
-# | 派发阶段             | 明确撤退            | 🔴 极高  |
+# | obv_ad_label        | 资金行为本质        | 风险等级        |
+# | ------------------  | ------------------ | -------------- |
+# | 极度缩量(隐蔽吸筹)    | 隐蔽建仓（VCP/WWD） | 🟢 低         |
+# | 明确吸筹             | 主动进攻            | 🟢 低         |
+# | 趋势加速放量         | 趋势加速            | 🟢 低          |
+# | 强趋势回撤           | 洗盘 / 换手         | 🟢 低~中       |
+# | 底部试探             | 早期试水            | 🟡 中          |
+# | 趋势中资金分歧        | 多空未统一          | 🟡 中          |
+# | 量价中性             | 无信息              | 🟡 中          |
+# | 高位放量分歧          | 高位博弈            | 🔴 高         |
+# | 高位滞涨(出货嫌疑)	  | 诱多/滞涨(Churning) | 🔴 高 (准派发) |
+# | 控盘减弱预警          | 主力松动            | 🔴 高         |
+# | 派发阶段             | 明确撤退            | 🔴 极高        |
 # =========================
 def classify_obv_ad_enhanced(
     obv_s20,
     ad_s20,
     obv_s5,
     ad_s5,
-    vol_rs_vcp,       # 5d/60d 缩量比
-    raw_price_tightness,   # 5d 波幅占比
+    vol_rs_vcp,             # 5d/60d 缩量比
+    raw_price_tightness,    # 5d 波幅占比
+    vol_spike_ratio,        # 当日量比
+    daily_change_pct,       # 当日价格变动幅度
     market_regime="多头"
 ):
     # 阈值定义
@@ -1919,10 +1975,18 @@ def classify_obv_ad_enhanced(
     
     price_tightness = 1.0 # 默认不紧致
     try:
+        vol_spike = float(vol_spike_ratio) if vol_spike_ratio is not None else 1.0
+        daily_chg = float(daily_change_pct) if daily_change_pct is not None else 0.02
         # 如果是字符串 '0.00124'，转为 float；如果转换失败或为 None，默认 1.0 (不紧致)
         price_tightness = float(raw_price_tightness) if raw_price_tightness is not None else 1.0
     except (ValueError, TypeError):
-        price_tightness = 1.0
+        vol_spike, daily_chg, price_tightness = 1.0, 0.02, 1.0
+
+    # 异常放量预警 (Churning / Stalling) ===
+    # 逻辑：成交量是均量的 2 倍以上，但股价变动小于 1%，且 OBV 并没有大幅走强
+    # 这通常意味着主力在高位对倒出货
+    if vol_spike > 2.0 and daily_chg < 0.01 and (obv_s20 <= STRONG or ad_s20 <= STRONG):
+        return "高位滞涨(出货嫌疑)"
 
     # --- 1️⃣ 核心新增：VCP 极度缩量（隐蔽吸筹 - WWD型） ---
     # 逻辑：价格波幅极其紧致（<4%）且成交量极度萎缩（比均量少30%以上）
@@ -2124,33 +2188,57 @@ def obv_ad_trade_gate(
 # ADX：用标准 Wilder 定义
 # =========================
 def compute_adx(df, period=14):
+    """
+    计算 ADX (平均趋向指标)
+    采用 Wilder's Smoothing (RMA) 算法，这是标准技术分析软件的通用实现。
+    """
+    if len(df) < period * 2:
+        return pd.Series(index=df.index, data=np.nan)
+
     high = df["high"]
     low = df["low"]
     close = df["close"]
 
-    plus_dm = high.diff()
-    minus_dm = low.diff().abs()
+    # 1. 计算 +DM 和 -DM (趋向变动值)
+    plus_dm_raw = high.diff()
+    minus_dm_raw = low.diff()
 
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    # 判定逻辑：只有当高点上移幅度大于低点下移幅度，且大于0时，+DM有效
+    plus_dm = np.where((plus_dm_raw > -minus_dm_raw) & (plus_dm_raw > 0), plus_dm_raw, 0.0)
+    # 判定逻辑：只有当低点下移幅度大于高点上移幅度，且大于0时，-DM有效
+    minus_dm = np.where((-minus_dm_raw > plus_dm_raw) & (-minus_dm_raw > 0), -minus_dm_raw, 0.0)
 
+    # 2. 计算 TR (真实波幅)
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low - close.shift()).abs()
     ], axis=1).max(axis=1)
 
-    atr = tr.rolling(period).mean()
+    # 3. 使用 Wilder's Smoothing 平滑处理 (EWM 算法)
+    # Wilder 的 alpha 等于 1/period
+    tr_smoothed = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_dm_smoothed = pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean()
+    minus_dm_smoothed = pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean()
 
-    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+    # 4. 计算 +DI 和 -DI
+    plus_di = 100 * (plus_dm_smoothed / tr_smoothed)
+    minus_di = 100 * (minus_dm_smoothed / tr_smoothed)
 
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    adx = dx.rolling(period).mean()
+    # 5. 计算 DX 并进一步平滑得到 ADX
+    # 处理分母为0的极端情况
+    dx_denom = plus_di + minus_di
+    dx = 100 * (abs(plus_di - minus_di) / dx_denom.replace(0, np.nan))
+    dx = dx.fillna(0)
+    
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
 
     return adx
 
 
+# =========================
+# 为单只股票计算最新 ADX（行级）
+# =========================
 def compute_latest_adx_from_row(
     row,
     price_history_map: dict,
@@ -2402,6 +2490,11 @@ def get_stateful_obv_score(
             "trend_stalling": 0.30,   # WS / CDE 的真实位置
             "no_trend": 0.15
         },
+        "高位滞涨(出货嫌疑)": {
+            "trend_active": 0.20,    # 即使趋势还在，也是强弩之末
+            "trend_stalling": 0.05,  # 几乎死刑
+            "no_trend": 0.00         # 死刑
+        },
         "控盘减弱预警": {
             "trend_active": 0.45,
             "trend_stalling": 0.25,
@@ -2475,6 +2568,30 @@ def compute_trade_score(row, sector_avg_rs: dict) -> float:
     trend_strength = row.get("trend_strength", "unknown")
     base_score += trend_bias_map.get(trend_strength, 0.0)
 
+    # === 财报风险动态调节 ===
+    # 逻辑：如果财报在未来 5 天内，且当前不是"隐蔽吸筹"，则大幅扣分以避险
+    earnings_penalty = 1.0
+    next_earnings = row.get("next_earnings_date")
+    if next_earnings:
+        try:
+            # 确保是 date 对象
+            if isinstance(next_earnings, str):
+                next_earnings = datetime.strptime(next_earnings, "%Y-%m-%d").date()
+            
+            days_to_earnings = (next_earnings - date.today()).days
+            
+            if 0 <= days_to_earnings <= 5:
+                print(f"⚠️ {row.get('stock_code')} 财报临近 ({days_to_earnings}天)，触发避险扣分")
+                earnings_penalty = 0.5 # 砍掉一半分数
+            elif 0 <= days_to_earnings <= 14:
+                earnings_penalty = 0.85 # 提醒性质扣分
+        except:
+            pass
+
+    if row.get("obv_ad_interpretation") == "极度缩量(隐蔽吸筹)":
+        earnings_penalty = 1.0  # 吸筹形态豁免
+    base_score *= earnings_penalty
+
     # === 板块强度过滤 (解决 WS 假信号关键) ===
     # 利用传入的 sector_avg_rs 字典进行比对
     stock_sector = row.get("sector")
@@ -2520,6 +2637,10 @@ def compute_trade_score(row, sector_avg_rs: dict) -> float:
         and trend_stage == "mid"
     ):
         final_score = max(final_score, 80)
+
+    # === Extension 修正 (新增) ===
+    if row.get("trend_stage") == "extended(超买)":
+        final_score = min(final_score, 60) # 强制压低评分
 
     return round(final_score, 2)
 
@@ -3685,6 +3806,13 @@ def classify_trend_stage(row) -> str:
             and price_tightness < 0.06 
             and dist_to_52w_high < 0.05):
             return "mid"
+        
+        # 2. Climax / Extended (新增：超买预警)
+        # 逻辑：股价偏离 MA50 超过 25%，通常意味着短期不可持续
+        # === MA50 偏离度 (Extension)
+        ma50_extension = ((close - ma50) / ma50) if ma50 else 0.0
+        if ma50_extension > 0.25:
+            return "extended(超买)"
 
         # ======================================================
         # 5️⃣ late stage（强趋势后段：位置 + 乖离 + 波动）
@@ -3833,7 +3961,7 @@ TRADE_STATE_MAX_POSITION = {
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["AVGO", "AMTM", "CDE", "ORCL", "MEM", "GOOG", "TLSA", "MU", "NVO", "AMAT", "INTC", "AMD", "PLTR"]
+CURRENT_SELECTED_TICKERS = ["AVGO", "CDE", "ORCL", "NEM", "GOOG", "TLSA", "MU", "SNDK", "NVO", "NVDA", "AMD", "PLTR", "SMCI"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -3948,7 +4076,9 @@ def main():
             row.get('ad_slope_5'),
             row.get('vol_rs_vcp'),
             row.get('price_tightness'),
-            market_regime=market_regime if 'market_regime' in globals() else None
+            row.get('vol_spike_ratio'),
+            row.get('daily_change_pct'),
+            market_regime=market_regime
         ),
         axis=1
     )
