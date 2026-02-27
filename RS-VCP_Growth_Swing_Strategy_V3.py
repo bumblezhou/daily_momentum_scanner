@@ -3967,7 +3967,7 @@ TRADE_STATE_MAX_POSITION = {
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["AVGO", "CDE", "ORCL", "NEM", "GOOG", "TLSA", "MU", "SNDK", "NVO", "NVDA", "AMD", "PLTR", "SMCI"]
+CURRENT_SELECTED_TICKERS = ["AVGO", "ORCL","GOOG", "TLSA", "MU", "NVO", "NVDA", "AMD", "PLTR", "EXEL", "NFLX"]
 # ===============================================
 
 # ===================== 主流程 =====================
