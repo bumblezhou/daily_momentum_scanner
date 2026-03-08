@@ -3967,7 +3967,7 @@ TRADE_STATE_MAX_POSITION = {
 
 # ===================== 配置 =====================
 # 填写你当前持仓或重点观察的股票
-CURRENT_SELECTED_TICKERS = ["AVGO", "ORCL","GOOG", "TLSA", "MU", "NVO", "NVDA", "AMD", "PLTR", "EXEL", "NFLX"]
+CURRENT_SELECTED_TICKERS = ["AVGO", "ORCL","GOOG", "TLSA", "MU", "NVO", "NVDA", "AMD", "PLTR", "CDE", "NFLX", "RTX"]
 # ===============================================
 
 # ===================== 主流程 =====================
@@ -4208,4 +4208,5 @@ def main():
         print("⚠️ 经过基本面严格筛选后，没有符合条件的股票。")
 
 if __name__ == "__main__":
-    main()
+    # main()
+    fetch_current_vix()
